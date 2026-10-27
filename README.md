@@ -11,7 +11,7 @@ jobs:
   example:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write   # required for Workload Identity Federation
+      id-token: write # required for Workload Identity Federation
 
     steps:
       - uses: google-github-actions/auth@v3
@@ -47,7 +47,7 @@ jobs:
 ## Inputs
 
 | Name           | Required | Description                                                                                                                 |
-|----------------|----------|-----------------------------------------------------------------------------------------------------------------------------|
+| -------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `client-id`    | YES      | GitHub App Client ID                                                                                                        |
 | `kms-key-name` | YES      | Cloud KMS key version resource name (`projects/.../keyRings/.../cryptoKeys/.../cryptoKeyVersions/...`)                      |
 | `repositories` |          | Comma or newline-separated list of repositories. Accepts `owner/repo` or `repo` format. Defaults to the current repository. |
@@ -56,7 +56,7 @@ jobs:
 ## Outputs
 
 | Name    | Description                          |
-|---------|--------------------------------------|
+| ------- | ------------------------------------ |
 | `token` | GitHub App installation access token |
 
 The token is automatically revoked when the job completes.
@@ -74,12 +74,10 @@ It has fewer dependencies than the original action.
 The action gets a Google Cloud access token by itself using a GitHub OIDC token, so `google-github-actions/auth` is not required.
 
 **When to use the minimal action:**
-
 - You are setting up a new Google Cloud project dedicated to this action, with no existing Google Cloud authentication in your CI.
 - You want to avoid introducing `google-github-actions/auth` into your workflow at all.
 
 **When to use the original action instead:**
-
 - You are already using `google-github-actions/auth` in your CI. You can reuse the existing authentication and add the KMS key, keeping your workflow simpler.
 
 ```yaml
@@ -104,7 +102,7 @@ action-test2:
 ## Inputs
 
 | Name                         | Required | Description                                                                                                                 |
-|------------------------------|----------|-----------------------------------------------------------------------------------------------------------------------------|
+| ---------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
 | `client-id`                  | YES      | GitHub App Client ID                                                                                                        |
 | `kms-key-name`               | YES      | Cloud KMS key version resource name (`projects/.../keyRings/.../cryptoKeys/.../cryptoKeyVersions/...`)                      |
 | `repositories`               |          | Comma or newline-separated list of repositories. Accepts `owner/repo` or `repo` format. Defaults to the current repository. |
