@@ -1866,10 +1866,66 @@ var require_request = __commonJS({
           return false;
         }
       }
-      onUpgrade(statusCode, headers, socket) {
+      /**
+       * @param {number|null} statusCode
+       * @param {Buffer[]|null} headers
+       * @param {import('node:stream').Duplex} socket
+       * @param {string} [statusText]
+       */
+      onUpgrade(statusCode, headers, socket, statusText = "") {
+        this.onFinally();
         assert(!this.aborted);
         assert(!this.completed);
-        return this[kHandler].onUpgrade(statusCode, headers, socket);
+        if (statusCode !== null) {
+          this.#publishUpgradeHeaders(statusCode, headers, statusText);
+        }
+        const result = this[kHandler].onUpgrade(statusCode, headers, socket);
+        if (!this.aborted) {
+          this.completed = true;
+          if (statusCode !== null) {
+            this.#publishUpgradeTrailers();
+          }
+        }
+        return result;
+      }
+      /**
+       * @param {number} statusCode
+       * @param {import('node:http2').IncomingHttpHeaders} headers
+       * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+       * @param {string} [statusText]
+       */
+      onUpgradeResponse(statusCode, headers, parseHeaders, statusText = "") {
+        assert(!this.aborted);
+        assert(this.completed);
+        if (channels.headers.hasSubscribers) {
+          this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText);
+        }
+        this.#publishUpgradeTrailers();
+      }
+      /**
+       * @param {Error} error
+       */
+      onUpgradeError(error2) {
+        assert(!this.aborted);
+        assert(this.completed);
+        if (channels.error.hasSubscribers) {
+          channels.error.publish({ request: this, error: error2 });
+        }
+      }
+      /**
+       * @param {number} statusCode
+       * @param {Buffer[]} headers
+       * @param {string} statusText
+       */
+      #publishUpgradeHeaders(statusCode, headers, statusText) {
+        if (channels.headers.hasSubscribers) {
+          channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+        }
+      }
+      #publishUpgradeTrailers() {
+        if (channels.trailers.hasSubscribers) {
+          channels.trailers.publish({ request: this, trailers: [] });
+        }
       }
       onComplete(trailers) {
         this.onFinally();
@@ -2054,6 +2110,7 @@ var require_dispatcher = __commonJS({
 var require_dispatcher_base = __commonJS({
   "node_modules/undici/lib/dispatcher/dispatcher-base.js"(exports2, module2) {
     "use strict";
+    var buffer = require("node:buffer");
     var Dispatcher = require_dispatcher();
     var {
       ClientDestroyedError,
@@ -2065,6 +2122,7 @@ var require_dispatcher_base = __commonJS({
     var kOnClosed = /* @__PURE__ */ Symbol("onClosed");
     var kInterceptedDispatch = /* @__PURE__ */ Symbol("Intercepted Dispatch");
     var kWebSocketOptions = /* @__PURE__ */ Symbol("webSocketOptions");
+    var kEventSourceOptions = /* @__PURE__ */ Symbol("eventSourceOptions");
     var DispatcherBase = class extends Dispatcher {
       constructor(opts) {
         super();
@@ -2073,11 +2131,17 @@ var require_dispatcher_base = __commonJS({
         this[kClosed] = false;
         this[kOnClosed] = [];
         this[kWebSocketOptions] = opts?.webSocket ?? {};
+        this[kEventSourceOptions] = opts?.eventSource ?? {};
       }
       get webSocketOptions() {
         return {
           maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
           maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+        };
+      }
+      get eventSourceOptions() {
+        return {
+          maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
         };
       }
       get destroyed() {
@@ -6012,7 +6076,7 @@ var require_client_h1 = __commonJS({
         }
       }
       onUpgrade(head) {
-        const { upgrade, client, socket, headers, statusCode } = this;
+        const { upgrade, client, socket, headers, statusCode, statusText } = this;
         assert(upgrade);
         assert(client[kSocket] === socket);
         assert(!socket.destroyed);
@@ -6037,9 +6101,10 @@ var require_client_h1 = __commonJS({
         client[kQueue][client[kRunningIdx]++] = null;
         client.emit("disconnect", client[kUrl], [client], new InformationalError("upgrade"));
         try {
-          request.onUpgrade(statusCode, headers, socket);
-        } catch (err) {
-          util.destroy(socket, err);
+          request.onUpgrade(statusCode, headers, socket, statusText);
+        } catch (error2) {
+          util.errorRequest(client, request, error2);
+          util.destroy(socket, error2);
         }
         client[kResume]();
       }
@@ -6226,7 +6291,6 @@ var require_client_h1 = __commonJS({
       socket[kSocketUsed] = false;
       socket[kParser] = new Parser(client, socket, llhttpInstance);
       addListener(socket, "error", function(err) {
-        assert(err.code !== "ERR_TLS_CERT_ALTNAME_INVALID");
         const parser = this[kParser];
         if (err.code === "ECONNRESET" && parser.statusCode && !parser.shouldKeepAlive) {
           const parserErr = parser.finish();
@@ -6331,21 +6395,20 @@ var require_client_h1 = __commonJS({
     }
     function clearIdleSocketValidation(socket) {
       if (socket[kIdleSocketValidationTimeout]) {
-        clearTimeout(socket[kIdleSocketValidationTimeout]);
+        clearImmediate(socket[kIdleSocketValidationTimeout]);
         socket[kIdleSocketValidationTimeout] = null;
       }
       socket[kIdleSocketValidation] = 0;
     }
     function scheduleIdleSocketValidation(client, socket) {
       socket[kIdleSocketValidation] = 1;
-      socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidationTimeout] = setImmediate(() => {
         socket[kIdleSocketValidationTimeout] = null;
         socket[kIdleSocketValidation] = 2;
         if (client[kSocket] === socket && !socket.destroyed) {
           client[kResume]();
         }
-      }, 0);
-      socket[kIdleSocketValidationTimeout].unref?.();
+      });
     }
     function resumeH1(client) {
       const socket = client[kSocket];
@@ -6443,11 +6506,17 @@ var require_client_h1 = __commonJS({
       }
       const socket = client[kSocket];
       clearIdleSocketValidation(socket);
-      const abort = (err) => {
-        if (request.aborted || request.completed) {
+      const abort = (error2) => {
+        if (request.aborted) {
           return;
         }
-        util.errorRequest(client, request, err || new RequestAbortedError());
+        if (request.completed) {
+          if (request.upgrade || request.method === "CONNECT") {
+            util.destroy(socket, new InformationalError("aborted"));
+          }
+          return;
+        }
+        util.errorRequest(client, request, error2 || new RequestAbortedError());
         util.destroy(body);
         util.destroy(socket, new InformationalError("aborted"));
       };
@@ -6803,6 +6872,7 @@ var require_client_h2 = __commonJS({
   "node_modules/undici/lib/dispatcher/client-h2.js"(exports2, module2) {
     "use strict";
     var assert = require("node:assert");
+    var { errorMonitor } = require("node:events");
     var { pipeline: pipeline2 } = require("node:stream");
     var util = require_util();
     var {
@@ -6863,6 +6933,10 @@ var require_client_h2 = __commonJS({
       }
       return result;
     }
+    function parseH2ResponseHeaders(headers) {
+      const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers;
+      return parseH2Headers(realHeaders);
+    }
     async function connectH2(client, socket) {
       client[kSocket] = socket;
       if (!h2ExperimentalWarned) {
@@ -6900,7 +6974,6 @@ var require_client_h2 = __commonJS({
       client[kHTTP2Session] = session;
       socket[kHTTP2Session] = session;
       util.addListener(socket, "error", function(err) {
-        assert(err.code !== "ERR_TLS_CERT_ALTNAME_INVALID");
         this[kError] = err;
         this[kClient][kOnError](err);
       });
@@ -6959,7 +7032,6 @@ var require_client_h2 = __commonJS({
       }
     }
     function onHttp2SessionError(err) {
-      assert(err.code !== "ERR_TLS_CERT_ALTNAME_INVALID");
       this[kSocket][kError] = err;
       this[kClient][kOnError](err);
     }
@@ -7026,16 +7098,22 @@ var require_client_h2 = __commonJS({
       const { hostname, port } = client[kUrl];
       headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ""}`;
       headers[HTTP2_HEADER_METHOD] = method;
-      const abort = (err) => {
-        if (request.aborted || request.completed) {
+      const abort = (error2) => {
+        if (request.aborted) {
           return;
         }
-        err = err || new RequestAbortedError();
-        util.errorRequest(client, request, err);
-        if (stream != null) {
-          util.destroy(stream, err);
+        if (request.completed) {
+          if (method === "CONNECT" && stream != null) {
+            util.destroy(stream, error2 || new RequestAbortedError());
+          }
+          return;
         }
-        util.destroy(body, err);
+        error2 = error2 || new RequestAbortedError();
+        util.errorRequest(client, request, error2);
+        if (stream != null) {
+          util.destroy(stream, error2);
+        }
+        util.destroy(body, error2);
         client[kQueue][client[kRunningIdx]++] = null;
         client[kResume]();
       };
@@ -7050,18 +7128,42 @@ var require_client_h2 = __commonJS({
       if (method === "CONNECT") {
         session.ref();
         stream = session.request(headers, { endStream: false, signal });
-        if (stream.id && !stream.pending) {
-          request.onUpgrade(null, null, stream);
-          ++session[kOpenStreams];
-          client[kQueue][client[kRunningIdx]++] = null;
-        } else {
-          stream.once("ready", () => {
+        let upgradeResponseFinished = false;
+        const onResponse = (headers2) => {
+          upgradeResponseFinished = true;
+          stream.off(errorMonitor, onUpgradeError);
+          request.onUpgradeResponse(Number(headers2[HTTP2_HEADER_STATUS]), headers2, parseH2ResponseHeaders);
+        };
+        const onUpgradeError = (error2) => {
+          upgradeResponseFinished = true;
+          stream.off("response", onResponse);
+          request.onUpgradeError(error2);
+        };
+        const onReady = () => {
+          try {
             request.onUpgrade(null, null, stream);
-            ++session[kOpenStreams];
-            client[kQueue][client[kRunningIdx]++] = null;
-          });
-        }
+          } catch (error2) {
+            stream.off("response", onResponse);
+            abort(error2);
+            return;
+          }
+          if (request.aborted) {
+            return;
+          }
+          stream.off("error", abort);
+          stream.once(errorMonitor, onUpgradeError);
+          client[kQueue][client[kRunningIdx]++] = null;
+        };
+        stream.once("response", onResponse);
+        stream.once("error", abort);
+        ++session[kOpenStreams];
+        onReady();
         stream.once("close", () => {
+          if (!upgradeResponseFinished && request.completed) {
+            stream.off("response", onResponse);
+            stream.off(errorMonitor, onUpgradeError);
+            request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`));
+          }
           session[kOpenStreams] -= 1;
           if (session[kOpenStreams] === 0) session.unref();
         });
@@ -7623,9 +7725,10 @@ var require_client = __commonJS({
         // h2
         maxConcurrentStreams,
         allowH2,
-        webSocket
+        webSocket,
+        eventSource
       } = {}) {
-        super({ webSocket });
+        super({ webSocket, eventSource });
         if (keepAlive !== void 0) {
           throw new InvalidArgumentError("unsupported keepAlive, use pipelining=0 instead");
         }
@@ -8522,7 +8625,7 @@ var require_agent = __commonJS({
       return opts && opts.connections === 1 ? new Client(origin, opts) : new Pool(origin, opts);
     }
     var Agent = class extends DispatcherBase {
-      constructor({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+      constructor({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
         if (typeof factory !== "function") {
           throw new InvalidArgumentError("factory must be a function.");
         }
@@ -8536,8 +8639,11 @@ var require_agent = __commonJS({
         if (connect && typeof connect !== "function") {
           connect = { ...connect };
         }
+        if (tls && typeof tls !== "function") {
+          tls = { ...tls };
+        }
         this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent) ? options.interceptors.Agent : [createRedirectInterceptor({ maxRedirections })];
-        this[kOptions] = { ...util.deepClone(options), connect };
+        this[kOptions] = { ...util.deepClone(options), connect, tls };
         this[kOptions].interceptors = options.interceptors ? { ...options.interceptors } : void 0;
         this[kMaxRedirections] = maxRedirections;
         this[kFactory] = factory;
@@ -9044,6 +9150,7 @@ var require_retry_handler = __commonJS({
         this.end = null;
         this.etag = null;
         this.resume = null;
+        this.headersSent = false;
         this.handler.onConnect((reason) => {
           this.aborted = true;
           if (this.abort) {
@@ -9052,6 +9159,17 @@ var require_retry_handler = __commonJS({
             this.reason = reason;
           }
         });
+      }
+      checkpointResponseEnd(headers, resume) {
+        if (this.end == null && this.opts.method !== "HEAD") {
+          const contentLength = headers["content-length"];
+          this.end = contentLength != null ? Number(contentLength) - 1 : null;
+          assert(
+            this.end == null || Number.isFinite(this.end),
+            "invalid content-length"
+          );
+        }
+        this.resume = this.end != null ? resume : null;
       }
       onRequestSent() {
         if (this.handler.onRequestSent) {
@@ -9114,7 +9232,9 @@ var require_retry_handler = __commonJS({
         const headers = parseHeaders(rawHeaders);
         this.retryCount += 1;
         if (statusCode >= 300) {
-          if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+          if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+            this.headersSent = true;
+            this.checkpointResponseEnd(headers, resume);
             return this.handler.onHeaders(
               statusCode,
               rawHeaders,
@@ -9169,8 +9289,15 @@ var require_retry_handler = __commonJS({
             return false;
           }
           const { start, size, end = size - 1 } = contentRange;
-          assert(this.start === start, "content-range mismatch");
-          assert(this.end == null || this.end === end, "content-range mismatch");
+          if (this.start !== start || this.end != null && this.end !== end) {
+            this.abort(
+              new RequestRetryError("Content-Range mismatch", statusCode, {
+                headers,
+                data: { count: this.retryCount }
+              })
+            );
+            return false;
+          }
           this.resume = resume;
           return true;
         }
@@ -9178,6 +9305,7 @@ var require_retry_handler = __commonJS({
           if (statusCode === 206) {
             const range = parseRangeHeader(headers["content-range"]);
             if (range == null) {
+              this.headersSent = true;
               return this.handler.onHeaders(
                 statusCode,
                 rawHeaders,
@@ -9209,6 +9337,7 @@ var require_retry_handler = __commonJS({
             "invalid content-length"
           );
           this.resume = resume;
+          this.headersSent = true;
           this.etag = headers.etag != null ? headers.etag : null;
           if (this.etag != null && this.etag.startsWith("W/")) {
             this.etag = null;
@@ -9236,7 +9365,7 @@ var require_retry_handler = __commonJS({
         return this.handler.onComplete(rawTrailers);
       }
       onError(err) {
-        if (this.aborted || isDisturbed(this.opts.body)) {
+        if (this.aborted || isDisturbed(this.opts.body) || this.headersSent && this.resume == null) {
           return this.handler.onError(err);
         }
         if (this.retryCount - this.retryCountCheckpoint > 0) {
@@ -14242,8 +14371,9 @@ var require_fetch = __commonJS({
         }
       );
       response.body = { stream, source: null, length: null };
-      fetchParams.controller.onAborted = onAborted;
-      fetchParams.controller.on("terminated", onAborted);
+      if (!fetchParams.controller.resume) {
+        fetchParams.controller.on("terminated", onAborted);
+      }
       fetchParams.controller.resume = async () => {
         while (true) {
           let bytes;
@@ -14343,7 +14473,6 @@ var require_fetch = __commonJS({
                 headersList.append(bufferToLowerCasedHeaderName(rawHeaders[i2]), rawHeaders[i2 + 1].toString("latin1"), true);
               }
               location = headersList.get("location", true);
-              this.body = new Readable({ read: resume });
               const decoders = [];
               const willFollow = location && request.redirect === "follow" && redirectStatusSet.has(status);
               if (request.method !== "HEAD" && request.method !== "CONNECT" && !nullBodyStatus.includes(status) && !willFollow) {
@@ -14351,7 +14480,7 @@ var require_fetch = __commonJS({
                 const codings = contentEncoding ? contentEncoding.toLowerCase().split(",") : [];
                 const maxContentEncodings = 5;
                 if (codings.length > maxContentEncodings) {
-                  reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
+                  this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`));
                   return true;
                 }
                 for (let i2 = codings.length - 1; i2 >= 0; --i2) {
@@ -14381,6 +14510,7 @@ var require_fetch = __commonJS({
                   }
                 }
               }
+              this.body = new Readable({ read: resume });
               const onError = this.onError.bind(this);
               resolve({
                 status,
@@ -14405,9 +14535,6 @@ var require_fetch = __commonJS({
             onComplete() {
               if (this.abort) {
                 fetchParams.controller.off("terminated", this.abort);
-              }
-              if (fetchParams.controller.onAborted) {
-                fetchParams.controller.off("terminated", fetchParams.controller.onAborted);
               }
               fetchParams.controller.ended = true;
               this.body.push(null);
@@ -17122,7 +17249,7 @@ var require_connection = __commonJS({
           const secProtocol = response.headersList.get("Sec-WebSocket-Protocol");
           if (secProtocol !== null) {
             const requestProtocols = getDecodeSplit("sec-websocket-protocol", request.headersList);
-            if (!requestProtocols.includes(secProtocol)) {
+            if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
               failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
               return;
             }
@@ -17270,6 +17397,7 @@ var require_permessage_deflate = __commonJS({
             if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
               callback(new MessageSizeExceededError());
               this.#inflate.removeAllListeners();
+              this.#inflate.destroy();
               this.#inflate = null;
               return;
             }
@@ -17481,6 +17609,16 @@ var require_receiver = __commonJS({
             if (isControlFrame(this.#info.opcode)) {
               this.#loop = this.parseControlFrame(body);
               this.#state = parserStates.INFO;
+              const socket = this.ws[kResponse].socket;
+              if (this.#loop && socket.writableNeedDrain) {
+                this.#loop = false;
+                socket.once("drain", () => {
+                  if (this.destroyed) return;
+                  this.#loop = true;
+                  this.run(callback);
+                });
+                return;
+              }
             } else {
               if (!this.#info.compressed) {
                 if (!this.writeFragments(body)) {
@@ -18174,6 +18312,7 @@ var require_util8 = __commonJS({
 var require_eventsource_stream = __commonJS({
   "node_modules/undici/lib/web/eventsource/eventsource-stream.js"(exports2, module2) {
     "use strict";
+    var buffer = require("node:buffer");
     var { Transform } = require("node:stream");
     var { isASCIINumber, isValidLastEventId } = require_util8();
     var BOM = [239, 187, 191];
@@ -18181,6 +18320,49 @@ var require_eventsource_stream = __commonJS({
     var CR2 = 13;
     var COLON2 = 58;
     var SPACE2 = 32;
+    var defaultMaxEventSize = buffer.kStringMaxLength;
+    var DATA = Buffer.from("data");
+    var EVENT = Buffer.from("event");
+    var ID = Buffer.from("id");
+    var RETRY = Buffer.from("retry");
+    var minParserItems = 1024;
+    var maxParserItems = 131072;
+    var bytesPerParserItem = 128;
+    function isASCIINumberBytes(buffer2, start) {
+      if (start >= buffer2.length) {
+        return false;
+      }
+      for (let i2 = start; i2 < buffer2.length; i2++) {
+        if (buffer2[i2] < 48 || buffer2[i2] > 57) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function isValidLastEventIdBytes(buffer2, start) {
+      for (let i2 = start; i2 < buffer2.length; i2++) {
+        if (buffer2[i2] === 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function isFieldName(line, length, field) {
+      if (length !== field.length) {
+        return false;
+      }
+      for (let i2 = 0; i2 < length; i2++) {
+        if (line[i2] !== field[i2]) {
+          return false;
+        }
+      }
+      return true;
+    }
+    function createMaxEventSizeExceededError() {
+      const error2 = new Error("EventSource message size exceeded");
+      error2.aborted = false;
+      return error2;
+    }
     var EventSourceStream = class extends Transform {
       /**
        * @type {eventSourceSettings}
@@ -18200,10 +18382,20 @@ var require_eventsource_stream = __commonJS({
        */
       eventEndCheck = false;
       /**
-       * @type {Buffer}
+       * @type {Buffer[]}
        */
-      buffer = null;
+      chunks = [];
+      chunkIndex = 0;
       pos = 0;
+      lineChunkIndex = 0;
+      linePos = 0;
+      lineLength = 0;
+      eventSize = 0;
+      eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 };
+      dataLineCount = 0;
+      maxEventSize;
+      maxDataLines;
+      maxBufferedChunks;
       event = {
         data: void 0,
         event: void 0,
@@ -18212,6 +18404,7 @@ var require_eventsource_stream = __commonJS({
       };
       /**
        * @param {object} options
+       * @param {number} [options.maxEventSize]
        * @param {eventSourceSettings} options.eventSourceSettings
        * @param {Function} [options.push]
        */
@@ -18219,6 +18412,10 @@ var require_eventsource_stream = __commonJS({
         options.readableObjectMode = true;
         super(options);
         this.state = options.eventSourceSettings || {};
+        this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize;
+        const parserItemLimit = this.maxEventSize > 0 ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem))) : 0;
+        this.maxDataLines = parserItemLimit;
+        this.maxBufferedChunks = parserItemLimit;
         if (options.push) {
           this.push = options.push;
         }
@@ -18234,63 +18431,34 @@ var require_eventsource_stream = __commonJS({
           callback();
           return;
         }
-        if (this.buffer) {
-          this.buffer = Buffer.concat([this.buffer, chunk]);
-        } else {
-          this.buffer = chunk;
+        if (this.maxEventSize > 0 && this.chunks.length >= this.maxBufferedChunks && chunk[0] !== LF2 && chunk[0] !== CR2) {
+          callback(createMaxEventSizeExceededError());
+          return;
         }
+        this.chunks.push(chunk);
         if (this.checkBOM) {
-          switch (this.buffer.length) {
-            case 1:
-              if (this.buffer[0] === BOM[0]) {
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              callback();
-              return;
-            case 2:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1]) {
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              break;
-            case 3:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = Buffer.alloc(0);
-                this.checkBOM = false;
-                callback();
-                return;
-              }
-              this.checkBOM = false;
-              break;
-            default:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = this.buffer.subarray(3);
-              }
-              this.checkBOM = false;
-              break;
+          if (this.handleBOM()) {
+            callback();
+            return;
           }
         }
-        while (this.pos < this.buffer.length) {
+        while (this.hasCurrentByte()) {
+          const byte = this.currentByte();
           if (this.eventEndCheck) {
             if (this.crlfCheck) {
-              if (this.buffer[this.pos] === LF2) {
-                this.buffer = this.buffer.subarray(this.pos + 1);
-                this.pos = 0;
+              if (byte === LF2) {
                 this.crlfCheck = false;
+                this.consumeCurrentByte();
                 continue;
               }
               this.crlfCheck = false;
             }
-            if (this.buffer[this.pos] === LF2 || this.buffer[this.pos] === CR2) {
-              if (this.buffer[this.pos] === CR2) {
+            if (byte === LF2 || byte === CR2) {
+              if (byte === CR2) {
                 this.crlfCheck = true;
               }
-              this.buffer = this.buffer.subarray(this.pos + 1);
-              this.pos = 0;
-              if (this.event.data !== void 0 || this.event.event || this.event.id || this.event.retry) {
+              this.consumeCurrentByte();
+              if (this.hasPendingEvent()) {
                 this.processEvent(this.event);
               }
               this.clearEvent();
@@ -18299,23 +18467,36 @@ var require_eventsource_stream = __commonJS({
             this.eventEndCheck = false;
             continue;
           }
-          if (this.buffer[this.pos] === LF2 || this.buffer[this.pos] === CR2) {
-            if (this.buffer[this.pos] === CR2) {
+          if (byte === LF2 || byte === CR2) {
+            if (byte === CR2) {
               this.crlfCheck = true;
             }
-            this.parseLine(this.buffer.subarray(0, this.pos), this.event);
-            this.buffer = this.buffer.subarray(this.pos + 1);
-            this.pos = 0;
+            try {
+              this.parseLine(this.readLine(), this.event);
+            } catch (error2) {
+              callback(error2);
+              return;
+            }
+            this.consumeCurrentByte();
             this.eventEndCheck = true;
             continue;
           }
-          this.pos++;
+          if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+            callback(createMaxEventSizeExceededError());
+            return;
+          }
+          this.advanceCursor();
         }
         callback();
       }
+      _destroy(error2, callback) {
+        this.chunks.length = 0;
+        this.clearEvent();
+        super._destroy(error2, callback);
+      }
       /**
        * @param {Buffer} line
-       * @param {EventStreamEvent} event
+       * @param {EventSourceStreamEvent} event
        */
       parseLine(line, event) {
         if (line.length === 0) {
@@ -18325,44 +18506,60 @@ var require_eventsource_stream = __commonJS({
         if (colonPosition === 0) {
           return;
         }
-        let field = "";
-        let value = "";
+        let fieldLength = line.length;
+        let valueStart = line.length;
         if (colonPosition !== -1) {
-          field = line.subarray(0, colonPosition).toString("utf8");
-          let valueStart = colonPosition + 1;
+          fieldLength = colonPosition;
+          valueStart = colonPosition + 1;
           if (line[valueStart] === SPACE2) {
             ++valueStart;
           }
-          value = line.subarray(valueStart).toString("utf8");
-        } else {
-          field = line.toString("utf8");
-          value = "";
         }
-        switch (field) {
-          case "data":
-            if (event[field] === void 0) {
-              event[field] = value;
-            } else {
-              event[field] += `
+        if (isFieldName(line, fieldLength, DATA)) {
+          if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+            throw createMaxEventSizeExceededError();
+          }
+          const valueBytes = line.length - valueStart;
+          const dataSize = this.eventFieldSizes.data + (event.data === void 0 ? 0 : 1) + valueBytes;
+          this.setEventFieldSize("data", dataSize);
+          const value = line.toString("utf8", valueStart);
+          if (event.data === void 0) {
+            event.data = value;
+          } else {
+            event.data += `
 ${value}`;
-            }
-            break;
-          case "retry":
-            if (isASCIINumber(value)) {
-              event[field] = value;
-            }
-            break;
-          case "id":
-            if (isValidLastEventId(value)) {
-              event[field] = value;
-            }
-            break;
-          case "event":
-            if (value.length > 0) {
-              event[field] = value;
-            }
-            break;
+          }
+          this.dataLineCount++;
+          return;
         }
+        if (isFieldName(line, fieldLength, RETRY)) {
+          if (isASCIINumberBytes(line, valueStart)) {
+            this.setEventFieldSize("retry", line.length - valueStart);
+            event.retry = line.toString("utf8", valueStart);
+          }
+          return;
+        }
+        if (isFieldName(line, fieldLength, ID)) {
+          if (isValidLastEventIdBytes(line, valueStart)) {
+            this.setEventFieldSize("id", line.length - valueStart);
+            event.id = line.toString("utf8", valueStart);
+          }
+          return;
+        }
+        if (isFieldName(line, fieldLength, EVENT)) {
+          if (valueStart < line.length) {
+            this.setEventFieldSize("event", line.length - valueStart);
+            event.event = line.toString("utf8", valueStart);
+          }
+        }
+      }
+      setEventFieldSize(field, size) {
+        const eventSize = this.eventSize - this.eventFieldSizes[field] + size;
+        if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+          throw createMaxEventSizeExceededError();
+        }
+        this.eventSize = eventSize;
+        this.eventFieldSizes[field] = size;
       }
       /**
        * @param {EventSourceStreamEvent} event
@@ -18386,12 +18583,128 @@ ${value}`;
         }
       }
       clearEvent() {
-        this.event = {
-          data: void 0,
-          event: void 0,
-          id: void 0,
-          retry: void 0
-        };
+        this.event.data = void 0;
+        this.event.event = void 0;
+        this.event.id = void 0;
+        this.event.retry = void 0;
+        this.eventSize = 0;
+        this.dataLineCount = 0;
+        this.eventFieldSizes.data = 0;
+        this.eventFieldSizes.event = 0;
+        this.eventFieldSizes.id = 0;
+        this.eventFieldSizes.retry = 0;
+      }
+      hasPendingEvent() {
+        return this.event.data !== void 0 || this.event.event !== void 0 || this.event.id !== void 0 || this.event.retry !== void 0;
+      }
+      hasCurrentByte() {
+        return this.chunkIndex < this.chunks.length && this.pos < this.chunks[this.chunkIndex].length;
+      }
+      currentByte() {
+        return this.chunks[this.chunkIndex][this.pos];
+      }
+      consumeCurrentByte() {
+        this.advanceCursor();
+        this.syncLineStartToCursor();
+      }
+      advanceCursor() {
+        this.pos++;
+        while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+          this.chunkIndex++;
+          this.pos = 0;
+        }
+      }
+      syncLineStartToCursor() {
+        this.lineChunkIndex = this.chunkIndex;
+        this.linePos = this.pos;
+        this.lineLength = 0;
+        this.dropConsumedChunks();
+      }
+      dropConsumedChunks() {
+        if (this.lineChunkIndex > 0) {
+          const consumed = this.lineChunkIndex;
+          this.chunks.splice(0, consumed);
+          this.lineChunkIndex = 0;
+          this.chunkIndex -= consumed;
+        }
+        if (this.chunkIndex === this.chunks.length) {
+          this.chunks.length = 0;
+          this.chunkIndex = 0;
+          this.pos = 0;
+          this.lineChunkIndex = 0;
+          this.linePos = 0;
+        }
+      }
+      readLine() {
+        if (this.lineChunkIndex === this.chunkIndex) {
+          return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos);
+        }
+        const chunks = [];
+        let length = 0;
+        for (let i2 = this.lineChunkIndex; i2 <= this.chunkIndex; i2++) {
+          const chunk = this.chunks[i2];
+          const start = i2 === this.lineChunkIndex ? this.linePos : 0;
+          const end = i2 === this.chunkIndex ? this.pos : chunk.length;
+          const slice = chunk.subarray(start, end);
+          length += slice.length;
+          chunks.push(slice);
+        }
+        return Buffer.concat(chunks, length);
+      }
+      peekBufferedByte(offset) {
+        let chunkIndex = this.lineChunkIndex;
+        let pos = this.linePos;
+        while (chunkIndex < this.chunks.length) {
+          const chunk = this.chunks[chunkIndex];
+          const remaining = chunk.length - pos;
+          if (offset < remaining) {
+            return chunk[pos + offset];
+          }
+          offset -= remaining;
+          chunkIndex++;
+          pos = 0;
+        }
+      }
+      discardLeadingBytes(count) {
+        while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+          const chunk = this.chunks[this.lineChunkIndex];
+          const remaining = chunk.length - this.linePos;
+          if (count < remaining) {
+            this.linePos += count;
+            count = 0;
+          } else {
+            count -= remaining;
+            this.lineChunkIndex++;
+            this.linePos = 0;
+          }
+        }
+        this.chunkIndex = this.lineChunkIndex;
+        this.pos = this.linePos;
+        this.dropConsumedChunks();
+      }
+      handleBOM() {
+        const first = this.peekBufferedByte(0);
+        const second = this.peekBufferedByte(1);
+        const third = this.peekBufferedByte(2);
+        if (second === void 0) {
+          if (first === BOM[0]) {
+            return true;
+          }
+          this.checkBOM = false;
+          return true;
+        }
+        if (third === void 0) {
+          if (first === BOM[0] && second === BOM[1]) {
+            return true;
+          }
+          this.checkBOM = false;
+          return false;
+        }
+        if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+          this.discardLeadingBytes(3);
+        }
+        this.checkBOM = false;
+        return !this.hasCurrentByte();
       }
     };
     module2.exports = {
@@ -18415,6 +18728,7 @@ var require_eventsource = __commonJS({
     var { delay } = require_util8();
     var { kEnumerableProperty } = require_util();
     var { environmentSettingsObject } = require_util2();
+    var { getGlobalDispatcher } = require_global2();
     var experimentalWarned = false;
     var defaultReconnectionTime = 3e3;
     var CONNECTING = 0;
@@ -18555,6 +18869,7 @@ var require_eventsource = __commonJS({
           this.#state.origin = response.urlList[response.urlList.length - 1].origin;
           const eventSourceStream = new EventSourceStream({
             eventSourceSettings: this.#state,
+            maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
             push: (event) => {
               this.dispatchEvent(createFastMessageEvent(
                 event.type,
@@ -18687,7 +19002,8 @@ var require_eventsource = __commonJS({
       {
         key: "dispatcher",
         // undici only
-        converter: webidl.converters.any
+        converter: webidl.converters.any,
+        defaultValue: () => getGlobalDispatcher()
       }
     ]);
     module2.exports = {
@@ -21253,11 +21569,25 @@ var require_protos = __commonJS({
                           fields: {
                             externalKeyUri: {
                               type: "string",
-                              id: 1
+                              id: 1,
+                              options: {
+                                "(google.api.field_behavior)": "OPTIONAL"
+                              }
                             },
                             ekmConnectionKeyPath: {
                               type: "string",
-                              id: 2
+                              id: 2,
+                              options: {
+                                "(google.api.field_behavior)": "OPTIONAL"
+                              }
+                            },
+                            ekmConnectionBackendOverride: {
+                              type: "string",
+                              id: 3,
+                              options: {
+                                "(google.api.field_behavior)": "OPTIONAL",
+                                "(google.api.resource_reference).type": "cloudkms.googleapis.com/EkmConnection"
+                              }
                             }
                           }
                         },
@@ -25999,7 +26329,7 @@ var require_package = __commonJS({
   "node_modules/@grpc/grpc-js/package.json"(exports2, module2) {
     module2.exports = {
       name: "@grpc/grpc-js",
-      version: "1.14.4",
+      version: "1.14.5",
       description: "gRPC Library for Node - pure JS implementation",
       homepage: "https://grpc.io/",
       repository: "https://github.com/grpc/grpc-node/tree/master/packages/grpc-js",
@@ -26172,6 +26502,9 @@ var require_logging = __commonJS({
     var enabledTracers = /* @__PURE__ */ new Set();
     var disabledTracers = /* @__PURE__ */ new Set();
     for (const tracerName of tracersString.split(",")) {
+      if (tracerName.length === 0) {
+        continue;
+      }
       if (tracerName.startsWith("-")) {
         disabledTracers.add(tracerName.substring(1));
       } else {
@@ -26179,12 +26512,16 @@ var require_logging = __commonJS({
       }
     }
     var allEnabled = enabledTracers.has("all");
+    var anyTracerEnabled = allEnabled || enabledTracers.size > 0;
     function trace(severity, tracer, text) {
       if (isTracerEnabled(tracer)) {
         (0, exports2.log)(severity, (/* @__PURE__ */ new Date()).toISOString() + " | v" + clientVersion + " " + process_1.pid + " | " + tracer + " | " + text);
       }
     }
     function isTracerEnabled(tracer) {
+      if (!anyTracerEnabled) {
+        return false;
+      }
       return !disabledTracers.has(tracer) && (allEnabled || enabledTracers.has(tracer));
     }
   }
@@ -27710,7 +28047,9 @@ var require_backoff_timeout = __commonJS({
             this.maxDelay = options.maxDelay;
           }
         }
-        this.trace("constructed initialDelay=" + this.initialDelay + " multiplier=" + this.multiplier + " jitter=" + this.jitter + " maxDelay=" + this.maxDelay);
+        if (this.traceEnabled) {
+          this.trace("constructed initialDelay=" + this.initialDelay + " multiplier=" + this.multiplier + " jitter=" + this.jitter + " maxDelay=" + this.maxDelay);
+        }
         this.nextDelay = this.initialDelay;
         this.timerId = setTimeout(() => {
         }, 0);
@@ -27719,12 +28058,19 @@ var require_backoff_timeout = __commonJS({
       static getNextId() {
         return this.nextId++;
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "{" + this.id + "} " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "{" + this.id + "} " + text);
+        }
       }
       runTimer(delay) {
         var _a, _b;
-        this.trace("runTimer(delay=" + delay + ")");
+        if (this.traceEnabled) {
+          this.trace("runTimer(delay=" + delay + ")");
+        }
         this.endTime = this.startTime;
         this.endTime.setMilliseconds(this.endTime.getMilliseconds() + delay);
         clearTimeout(this.timerId);
@@ -27763,7 +28109,9 @@ var require_backoff_timeout = __commonJS({
        * retroactively apply that reset to the current timer.
        */
       reset() {
-        this.trace("reset() running=" + this.running);
+        if (this.traceEnabled) {
+          this.trace("reset() running=" + this.running);
+        }
         this.nextDelay = this.initialDelay;
         if (this.running) {
           const now = /* @__PURE__ */ new Date();
@@ -41010,7 +41358,7 @@ var require_single_subchannel_channel = __commonJS({
             }
           }
         };
-        this.childCall = this.subchannel.createCall(credsMetadata, this.options.host, this.method, childListener);
+        this.childCall = this.subchannel.createCall(credsMetadata, this.options.host, this.method, childListener, this.callNumber);
         if (this.readPending) {
           this.childCall.startRead();
         }
@@ -41180,7 +41528,9 @@ var require_subchannel = __commonJS({
         }
         this.channelzRef = (0, channelz_1.registerChannelzSubchannel)(this.subchannelAddressString, () => this.getChannelzInfo(), this.channelzEnabled);
         this.channelzTrace.addTrace("CT_INFO", "Subchannel created");
-        this.trace("Subchannel constructed with options " + JSON.stringify(options, void 0, 2));
+        if (this.traceEnabled) {
+          this.trace("Subchannel constructed with options " + JSON.stringify(options, void 0, 2));
+        }
         this.secureConnector = credentials._createSecureConnector(channelTarget, options);
       }
       getChannelzInfo() {
@@ -41192,11 +41542,21 @@ var require_subchannel = __commonJS({
           target: this.subchannelAddressString
         };
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
+      get refTraceEnabled() {
+        return logging.isTracerEnabled("subchannel_refcount");
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       refTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, "subchannel_refcount", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.refTraceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, "subchannel_refcount", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       handleBackoffTimer() {
         if (this.continueConnecting) {
@@ -41253,10 +41613,12 @@ var require_subchannel = __commonJS({
         if (oldStates.indexOf(this.connectivityState) === -1) {
           return false;
         }
-        if (errorMessage) {
-          this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] + " -> " + connectivity_state_1.ConnectivityState[newState] + ' with error "' + errorMessage + '"');
-        } else {
-          this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] + " -> " + connectivity_state_1.ConnectivityState[newState]);
+        if (this.traceEnabled) {
+          if (errorMessage) {
+            this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] + " -> " + connectivity_state_1.ConnectivityState[newState] + ' with error "' + errorMessage + '"');
+          } else {
+            this.trace(connectivity_state_1.ConnectivityState[this.connectivityState] + " -> " + connectivity_state_1.ConnectivityState[newState]);
+          }
         }
         if (this.channelzEnabled) {
           this.channelzTrace.addTrace("CT_INFO", "Connectivity state change to " + connectivity_state_1.ConnectivityState[newState]);
@@ -41300,11 +41662,15 @@ var require_subchannel = __commonJS({
         return true;
       }
       ref() {
-        this.refTrace("refcount " + this.refcount + " -> " + (this.refcount + 1));
+        if (this.refTraceEnabled) {
+          this.refTrace("refcount " + this.refcount + " -> " + (this.refcount + 1));
+        }
         this.refcount += 1;
       }
       unref() {
-        this.refTrace("refcount " + this.refcount + " -> " + (this.refcount - 1));
+        if (this.refTraceEnabled) {
+          this.refTrace("refcount " + this.refcount + " -> " + (this.refcount - 1));
+        }
         this.refcount -= 1;
         if (this.refcount === 0) {
           this.channelzTrace.addTrace("CT_INFO", "Shutting down");
@@ -41322,7 +41688,7 @@ var require_subchannel = __commonJS({
         }
         return false;
       }
-      createCall(metadata, host, method, listener) {
+      createCall(metadata, host, method, listener, callId) {
         if (!this.transport) {
           throw new Error("Cannot create call, subchannel not READY");
         }
@@ -41342,7 +41708,7 @@ var require_subchannel = __commonJS({
         } else {
           statsTracker = {};
         }
-        return this.transport.createCall(metadata, host, method, listener, statsTracker);
+        return this.transport.createCall(metadata, host, method, listener, statsTracker, callId);
       }
       /**
        * If the subchannel is currently IDLE, start connecting and switch to the
@@ -41448,9 +41814,11 @@ var require_environment = __commonJS({
   "node_modules/@grpc/grpc-js/build/src/environment.js"(exports2) {
     "use strict";
     var _a;
+    var _b;
     Object.defineProperty(exports2, "__esModule", { value: true });
-    exports2.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = void 0;
+    exports2.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS = exports2.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = void 0;
     exports2.GRPC_NODE_USE_ALTERNATIVE_RESOLVER = ((_a = process.env.GRPC_NODE_USE_ALTERNATIVE_RESOLVER) !== null && _a !== void 0 ? _a : "false") === "true";
+    exports2.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS = ((_b = process.env.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) !== null && _b !== void 0 ? _b : "false") === "true";
   }
 });
 
@@ -42121,11 +42489,13 @@ var require_subchannel_call = __commonJS({
         const maxReceiveMessageLength = (_a = transport.getOptions()["grpc.max_receive_message_length"]) !== null && _a !== void 0 ? _a : constants_1.DEFAULT_MAX_RECEIVE_MESSAGE_LENGTH;
         this.decoder = new stream_decoder_1.StreamDecoder(maxReceiveMessageLength);
         http2Stream.on("response", (headers, flags) => {
-          let headersString = "";
-          for (const header of Object.keys(headers)) {
-            headersString += "		" + header + ": " + headers[header] + "\n";
+          if (this.traceEnabled) {
+            let headersString = "";
+            for (const header of Object.keys(headers)) {
+              headersString += "		" + header + ": " + headers[header] + "\n";
+            }
+            this.trace("Received server headers:\n" + headersString);
           }
-          this.trace("Received server headers:\n" + headersString);
           this.httpStatusCode = headers[":status"];
           if (flags & http22.constants.NGHTTP2_FLAG_END_STREAM) {
             this.handleTrailers(headers);
@@ -42151,7 +42521,9 @@ var require_subchannel_call = __commonJS({
           if (this.statusOutput) {
             return;
           }
-          this.trace("receive HTTP/2 data frame of length " + data.length);
+          if (this.traceEnabled) {
+            this.trace("receive HTTP/2 data frame of length " + data.length);
+          }
           let messages;
           try {
             messages = this.decoder.write(data);
@@ -42165,7 +42537,9 @@ var require_subchannel_call = __commonJS({
             return;
           }
           for (const message of messages) {
-            this.trace("parsed message of length " + message.length);
+            if (this.traceEnabled) {
+              this.trace("parsed message of length " + message.length);
+            }
             this.callEventTracker.addMessageReceived();
             this.tryPush(message);
           }
@@ -42178,7 +42552,9 @@ var require_subchannel_call = __commonJS({
           this.serverEndedCall = true;
           process.nextTick(() => {
             var _a2;
-            this.trace("HTTP/2 stream closed with code " + http2Stream.rstCode);
+            if (this.traceEnabled) {
+              this.trace("HTTP/2 stream closed with code " + http2Stream.rstCode);
+            }
             if (((_a2 = this.finalStatus) === null || _a2 === void 0 ? void 0 : _a2.code) === constants_1.Status.OK) {
               return;
             }
@@ -42246,7 +42622,9 @@ var require_subchannel_call = __commonJS({
         });
         http2Stream.on("error", (err) => {
           if (err.code !== "ERR_HTTP2_STREAM_ERROR") {
-            this.trace("Node error event: message=" + err.message + " code=" + err.code + " errno=" + getSystemErrorName(err.errno) + " syscall=" + err.syscall);
+            if (this.traceEnabled) {
+              this.trace("Node error event: message=" + err.message + " code=" + err.code + " errno=" + getSystemErrorName(err.errno) + " syscall=" + err.syscall);
+            }
             this.internalError = err;
           }
           this.callEventTracker.onStreamEnd(false);
@@ -42268,7 +42646,9 @@ var require_subchannel_call = __commonJS({
       outputStatus() {
         if (!this.statusOutput) {
           this.statusOutput = true;
-          this.trace("ended with status: code=" + this.finalStatus.code + ' details="' + this.finalStatus.details + '"');
+          if (this.traceEnabled) {
+            this.trace("ended with status: code=" + this.finalStatus.code + ' details="' + this.finalStatus.details + '"');
+          }
           this.callEventTracker.onCallEnd(this.finalStatus);
           process.nextTick(() => {
             this.listener.onReceiveStatus(this.finalStatus);
@@ -42276,8 +42656,13 @@ var require_subchannel_call = __commonJS({
           this.http2Stream.resume();
         }
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_2.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callId + "] " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_2.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callId + "] " + text);
+        }
       }
       /**
        * On first call, emits a 'status' event with the given StatusObject.
@@ -42299,7 +42684,9 @@ var require_subchannel_call = __commonJS({
         }
       }
       push(message) {
-        this.trace("pushing to reader message of length " + (message instanceof Buffer ? message.length : null));
+        if (this.traceEnabled) {
+          this.trace("pushing to reader message of length " + (message instanceof Buffer ? message.length : null));
+        }
         this.canPush = false;
         this.isPushPending = true;
         process.nextTick(() => {
@@ -42316,18 +42703,22 @@ var require_subchannel_call = __commonJS({
           this.http2Stream.pause();
           this.push(messageBytes);
         } else {
-          this.trace("unpushedReadMessages.push message of length " + messageBytes.length);
+          if (this.traceEnabled) {
+            this.trace("unpushedReadMessages.push message of length " + messageBytes.length);
+          }
           this.unpushedReadMessages.push(messageBytes);
         }
       }
       handleTrailers(headers) {
         this.serverEndedCall = true;
         this.callEventTracker.onStreamEnd(true);
-        let headersString = "";
-        for (const header of Object.keys(headers)) {
-          headersString += "		" + header + ": " + headers[header] + "\n";
+        if (this.traceEnabled) {
+          let headersString = "";
+          for (const header of Object.keys(headers)) {
+            headersString += "		" + header + ": " + headers[header] + "\n";
+          }
+          this.trace("Received server trailers:\n" + headersString);
         }
-        this.trace("Received server trailers:\n" + headersString);
         let metadata;
         try {
           metadata = metadata_1.Metadata.fromHttp2Headers(headers);
@@ -42338,7 +42729,9 @@ var require_subchannel_call = __commonJS({
         let status;
         if (typeof metadataMap["grpc-status"] === "string") {
           const receivedStatus = Number(metadataMap["grpc-status"]);
-          this.trace("received status code " + receivedStatus + " from server");
+          if (this.traceEnabled) {
+            this.trace("received status code " + receivedStatus + " from server");
+          }
           metadata.remove("grpc-status");
           let details = "";
           if (typeof metadataMap["grpc-message"] === "string") {
@@ -42348,7 +42741,9 @@ var require_subchannel_call = __commonJS({
               details = metadataMap["grpc-message"];
             }
             metadata.remove("grpc-message");
-            this.trace('received status details string "' + details + '" from server');
+            if (this.traceEnabled) {
+              this.trace('received status details string "' + details + '" from server');
+            }
           }
           status = {
             code: receivedStatus,
@@ -42373,7 +42768,9 @@ var require_subchannel_call = __commonJS({
           return;
         }
         if (this.serverEndedCall) {
-          this.http2Stream.end();
+          if (!this.http2Stream.writableEnded) {
+            this.http2Stream.end();
+          }
         } else {
           let code;
           if (((_a = this.finalStatus) === null || _a === void 0 ? void 0 : _a.code) === constants_1.Status.OK) {
@@ -42381,12 +42778,16 @@ var require_subchannel_call = __commonJS({
           } else {
             code = http22.constants.NGHTTP2_CANCEL;
           }
-          this.trace("close http2 stream with code " + code);
+          if (this.traceEnabled) {
+            this.trace("close http2 stream with code " + code);
+          }
           this.http2Stream.close(code);
         }
       }
       cancelWithStatus(status, details) {
-        this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+          this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        }
         this.endCall({ code: status, details, metadata: new metadata_1.Metadata() });
       }
       getStatus() {
@@ -42416,7 +42817,9 @@ var require_subchannel_call = __commonJS({
         this.http2Stream.resume();
       }
       sendMessageWithContext(context, message) {
-        this.trace("write() called with message of length " + message.length);
+        if (this.traceEnabled) {
+          this.trace("write() called with message of length " + message.length);
+        }
         const cb = (error2) => {
           process.nextTick(() => {
             var _a;
@@ -42430,7 +42833,9 @@ var require_subchannel_call = __commonJS({
             (_a = context.callback) === null || _a === void 0 ? void 0 : _a.call(context);
           });
         };
-        this.trace("sending data chunk of length " + message.length);
+        if (this.traceEnabled) {
+          this.trace("sending data chunk of length " + message.length);
+        }
         this.callEventTracker.addMessageSent();
         try {
           this.http2Stream.write(message, cb);
@@ -42444,6 +42849,9 @@ var require_subchannel_call = __commonJS({
       }
       halfClose() {
         this.trace("end() called");
+        if (this.http2Stream.destroyed || this.http2Stream.writableEnded) {
+          return;
+        }
         this.trace("calling end() on HTTP/2 stream");
         this.http2Stream.end();
       }
@@ -42529,18 +42937,24 @@ var require_transport = __commonJS({
           if (errorCode === http22.constants.NGHTTP2_ENHANCE_YOUR_CALM && opaqueData && opaqueData.equals(tooManyPingsData)) {
             tooManyPings = true;
           }
-          this.trace("connection closed by GOAWAY with code " + errorCode + " and data " + (opaqueData === null || opaqueData === void 0 ? void 0 : opaqueData.toString()));
+          if (this.traceEnabled) {
+            this.trace("connection closed by GOAWAY with code " + errorCode + " and data " + (opaqueData === null || opaqueData === void 0 ? void 0 : opaqueData.toString()));
+          }
           this.reportDisconnectToOwner(tooManyPings);
         });
         session.once("error", (error2) => {
-          this.trace("connection closed with error " + error2.message);
+          if (this.traceEnabled) {
+            this.trace("connection closed with error " + error2.message);
+          }
           this.handleDisconnect();
         });
         session.socket.once("close", (hadError) => {
-          this.trace("connection closed. hadError=" + hadError);
+          if (this.traceEnabled) {
+            this.trace("connection closed. hadError=" + hadError);
+          }
           this.handleDisconnect();
         });
-        if (logging.isTracerEnabled(TRACER_NAME)) {
+        if (this.traceEnabled) {
           session.on("remoteSettings", (settings) => {
             this.trace("new settings received" + (this.session !== session ? " on the old connection" : "") + ": " + JSON.stringify(settings));
           });
@@ -42551,7 +42965,7 @@ var require_transport = __commonJS({
         if (this.keepaliveWithoutCalls) {
           this.maybeStartKeepalivePingTimer();
         }
-        if (session.socket instanceof tls_1.TLSSocket) {
+        if (session.socket instanceof tls_1.TLSSocket && session.socket.authorized) {
           this.authContext = {
             transportSecurityType: "ssl",
             sslPeerCertificate: session.socket.getPeerCertificate()
@@ -42600,17 +43014,37 @@ var require_transport = __commonJS({
         };
         return socketInfo;
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
+      get keepaliveTraceEnabled() {
+        return logging.isTracerEnabled("keepalive");
+      }
+      get flowControlTraceEnabled() {
+        return logging.isTracerEnabled(FLOW_CONTROL_TRACER_NAME);
+      }
+      get internalsTraceEnabled() {
+        return logging.isTracerEnabled("transport_internals");
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       keepaliveTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, "keepalive", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.keepaliveTraceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, "keepalive", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       flowControlTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, FLOW_CONTROL_TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.flowControlTraceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, FLOW_CONTROL_TRACER_NAME, "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       internalsTrace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, "transport_internals", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        if (this.internalsTraceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, "transport_internals", "(" + this.channelzRef.id + ") " + this.subchannelAddressString + " " + text);
+        }
       }
       /**
        * Indicate to the owner of this object that this transport should no longer
@@ -42660,7 +43094,9 @@ var require_transport = __commonJS({
         if (this.channelzEnabled) {
           this.keepalivesSent += 1;
         }
-        this.keepaliveTrace("Sending ping with timeout " + this.keepaliveTimeoutMs + "ms");
+        if (this.keepaliveTraceEnabled) {
+          this.keepaliveTrace("Sending ping with timeout " + this.keepaliveTimeoutMs + "ms");
+        }
         this.keepaliveTimer = setTimeout(() => {
           this.keepaliveTimer = null;
           this.keepaliveTrace("Ping timeout passed without response");
@@ -42672,7 +43108,9 @@ var require_transport = __commonJS({
           const pingSentSuccessfully = this.session.ping((err, duration, payload) => {
             this.clearKeepaliveTimeout();
             if (err) {
-              this.keepaliveTrace("Ping failed with error " + err.message);
+              if (this.keepaliveTraceEnabled) {
+                this.keepaliveTrace("Ping failed with error " + err.message);
+              }
               this.handleDisconnect();
             } else {
               this.keepaliveTrace("Received ping response");
@@ -42686,7 +43124,9 @@ var require_transport = __commonJS({
           pingSendError = (e2 instanceof Error ? e2.message : "") || "Unknown error";
         }
         if (pingSendError) {
-          this.keepaliveTrace("Ping send failed: " + pingSendError);
+          if (this.keepaliveTraceEnabled) {
+            this.keepaliveTrace("Ping send failed: " + pingSendError);
+          }
           this.handleDisconnect();
         }
       }
@@ -42737,7 +43177,7 @@ var require_transport = __commonJS({
           }
         }
       }
-      createCall(metadata, host, method, listener, subchannelCallStatsTracker) {
+      createCall(metadata, host, method, listener, subchannelCallStatsTracker, callId) {
         const headers = metadata.toHttp2Headers();
         headers[HTTP2_HEADER_AUTHORITY] = host;
         headers[HTTP2_HEADER_USER_AGENT] = this.userAgent;
@@ -42752,8 +43192,12 @@ var require_transport = __commonJS({
           this.handleDisconnect();
           throw e2;
         }
-        this.flowControlTrace("local window size: " + this.session.state.localWindowSize + " remote window size: " + this.session.state.remoteWindowSize);
-        this.internalsTrace("session.closed=" + this.session.closed + " session.destroyed=" + this.session.destroyed + " session.socket.destroyed=" + this.session.socket.destroyed);
+        if (this.flowControlTraceEnabled) {
+          this.flowControlTrace("local window size: " + this.session.state.localWindowSize + " remote window size: " + this.session.state.remoteWindowSize);
+        }
+        if (this.internalsTraceEnabled) {
+          this.internalsTrace("session.closed=" + this.session.closed + " session.destroyed=" + this.session.destroyed + " session.socket.destroyed=" + this.session.socket.destroyed);
+        }
         let eventTracker;
         let call;
         if (this.channelzEnabled) {
@@ -42807,7 +43251,7 @@ var require_transport = __commonJS({
             }
           };
         }
-        call = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, (0, call_number_1.getNextCallNumber)());
+        call = new subchannel_call_1.Http2SubchannelCall(http2Stream, eventTracker, listener, this, callId !== null && callId !== void 0 ? callId : (0, call_number_1.getNextCallNumber)());
         this.addActiveCall(call);
         return call;
       }
@@ -42834,8 +43278,13 @@ var require_transport = __commonJS({
         this.session = null;
         this.isShutdown = false;
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, (0, uri_parser_1.uriToString)(this.channelTarget) + " " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, (0, uri_parser_1.uriToString)(this.channelTarget) + " " + text);
+        }
       }
       createSession(secureConnectResult, address, options) {
         if (this.isShutdown) {
@@ -42872,7 +43321,9 @@ var require_transport = __commonJS({
             var _a2;
             (_a2 = this.session) === null || _a2 === void 0 ? void 0 : _a2.destroy();
             errorMessage = error2.message;
-            this.trace("connection failed with error " + errorMessage);
+            if (this.traceEnabled) {
+              this.trace("connection failed with error " + errorMessage);
+            }
             if (!reportedError) {
               reportedError = true;
               reject(`${errorMessage} (${(/* @__PURE__ */ new Date()).toISOString()})`);
@@ -42953,14 +43404,22 @@ var require_transport = __commonJS({
         let secureConnectResult = null;
         const addressString = (0, subchannel_address_1.subchannelAddressToString)(address);
         try {
-          this.trace(addressString + " Waiting for secureConnector to be ready");
+          if (this.traceEnabled) {
+            this.trace(addressString + " Waiting for secureConnector to be ready");
+          }
           await secureConnector.waitForReady();
-          this.trace(addressString + " secureConnector is ready");
+          if (this.traceEnabled) {
+            this.trace(addressString + " secureConnector is ready");
+          }
           tcpConnection = await this.tcpConnect(address, options);
           tcpConnection.setNoDelay();
-          this.trace(addressString + " Established TCP connection");
+          if (this.traceEnabled) {
+            this.trace(addressString + " Established TCP connection");
+          }
           secureConnectResult = await secureConnector.connect(tcpConnection);
-          this.trace(addressString + " Established secure connection");
+          if (this.traceEnabled) {
+            this.trace(addressString + " Established secure connection");
+          }
           return this.createSession(secureConnectResult, address, options);
         } catch (e2) {
           tcpConnection === null || tcpConnection === void 0 ? void 0 : tcpConnection.destroy();
@@ -43141,17 +43600,28 @@ var require_load_balancing_call = __commonJS({
         }
         return deadlineInfo;
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        }
+      }
+      getSubchannelString(subchannel) {
+        return subchannel ? "(" + subchannel.getChannelzRef().id + ") " + subchannel.getAddress() : "" + subchannel;
       }
       outputStatus(status, progress) {
         var _a, _b;
         if (!this.ended) {
           this.ended = true;
-          this.trace("ended with status: code=" + status.code + ' details="' + status.details + '" start time=' + this.startTime.toISOString());
+          if (this.traceEnabled) {
+            this.trace("ended with status: code=" + status.code + ' details="' + status.details + '" start time=' + this.startTime.toISOString());
+          }
           const finalStatus = Object.assign(Object.assign({}, status), { progress });
           (_a = this.listener) === null || _a === void 0 ? void 0 : _a.onReceiveStatus(finalStatus);
           (_b = this.onCallEnded) === null || _b === void 0 ? void 0 : _b.call(this, finalStatus.code, finalStatus.details, finalStatus.metadata);
+          this.channel.removeCallFromPickQueue(this);
         }
       }
       doPick() {
@@ -43165,8 +43635,9 @@ var require_load_balancing_call = __commonJS({
         this.trace("Pick called");
         const finalMetadata = this.metadata.clone();
         const pickResult = this.channel.doPick(finalMetadata, this.callConfig.pickInformation);
-        const subchannelString = pickResult.subchannel ? "(" + pickResult.subchannel.getChannelzRef().id + ") " + pickResult.subchannel.getAddress() : "" + pickResult.subchannel;
-        this.trace("Pick result: " + picker_1.PickResultType[pickResult.pickResultType] + " subchannel: " + subchannelString + " status: " + ((_a = pickResult.status) === null || _a === void 0 ? void 0 : _a.code) + " " + ((_b = pickResult.status) === null || _b === void 0 ? void 0 : _b.details));
+        if (this.traceEnabled) {
+          this.trace("Pick result: " + picker_1.PickResultType[pickResult.pickResultType] + " subchannel: " + this.getSubchannelString(pickResult.subchannel) + " status: " + ((_a = pickResult.status) === null || _a === void 0 ? void 0 : _a.code) + " " + ((_b = pickResult.status) === null || _b === void 0 ? void 0 : _b.details));
+        }
         switch (pickResult.pickResultType) {
           case picker_1.PickResultType.COMPLETE:
             const combinedCallCredentials = this.credentials.compose(pickResult.subchannel.getCallCredentials());
@@ -43185,7 +43656,9 @@ var require_load_balancing_call = __commonJS({
                 }, "PROCESSED");
               }
               if (pickResult.subchannel.getConnectivityState() !== connectivity_state_1.ConnectivityState.READY) {
-                this.trace("Picked subchannel " + subchannelString + " has state " + connectivity_state_1.ConnectivityState[pickResult.subchannel.getConnectivityState()] + " after getting credentials metadata. Retrying pick");
+                if (this.traceEnabled) {
+                  this.trace("Picked subchannel " + this.getSubchannelString(pickResult.subchannel) + " has state " + connectivity_state_1.ConnectivityState[pickResult.subchannel.getConnectivityState()] + " after getting credentials metadata. Retrying pick");
+                }
                 this.doPick();
                 return;
               }
@@ -43210,10 +43683,12 @@ var require_load_balancing_call = __commonJS({
                       this.outputStatus(status, "PROCESSED");
                     }
                   }
-                });
+                }, this.callNumber);
                 this.childStartTime = /* @__PURE__ */ new Date();
               } catch (error2) {
-                this.trace("Failed to start call on picked subchannel " + subchannelString + " with error " + error2.message);
+                if (this.traceEnabled) {
+                  this.trace("Failed to start call on picked subchannel " + this.getSubchannelString(pickResult.subchannel) + " with error " + error2.message);
+                }
                 this.outputStatus({
                   code: constants_1.Status.INTERNAL,
                   details: "Failed to start HTTP/2 stream with error " + error2.message,
@@ -43223,7 +43698,9 @@ var require_load_balancing_call = __commonJS({
               }
               (_a2 = pickResult.onCallStarted) === null || _a2 === void 0 ? void 0 : _a2.call(pickResult);
               this.onCallEnded = pickResult.onCallEnded;
-              this.trace("Created child call [" + this.child.getCallNumber() + "]");
+              if (this.traceEnabled) {
+                this.trace("Created child call [" + this.child.getCallNumber() + "]");
+              }
               if (this.readPending) {
                 this.child.startRead();
               }
@@ -43264,7 +43741,9 @@ var require_load_balancing_call = __commonJS({
       }
       cancelWithStatus(status, details) {
         var _a;
-        this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+          this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        }
         (_a = this.child) === null || _a === void 0 ? void 0 : _a.cancelWithStatus(status, details);
         this.outputStatus({ code: status, details, metadata: new metadata_1.Metadata() }, "PROCESSED");
       }
@@ -43279,7 +43758,9 @@ var require_load_balancing_call = __commonJS({
         this.doPick();
       }
       sendMessageWithContext(context, message) {
-        this.trace("write() called with message of length " + message.length);
+        if (this.traceEnabled) {
+          this.trace("write() called with message of length " + message.length);
+        }
         if (this.child) {
           this.child.sendMessageWithContext(context, message);
         } else {
@@ -43366,23 +43847,34 @@ var require_resolving_call = __commonJS({
             });
           }
           if (options.flags & constants_1.Propagate.DEADLINE) {
-            this.trace("Propagating deadline from parent: " + options.parentCall.getDeadline());
+            if (this.traceEnabled) {
+              this.trace("Propagating deadline from parent: " + options.parentCall.getDeadline());
+            }
             this.deadline = (0, deadline_1.minDeadline)(this.deadline, options.parentCall.getDeadline());
           }
         }
         this.trace("Created");
         this.runDeadlineTimer();
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        }
       }
       runDeadlineTimer() {
         clearTimeout(this.deadlineTimer);
         this.deadlineStartTime = /* @__PURE__ */ new Date();
-        this.trace("Deadline: " + (0, deadline_1.deadlineToString)(this.deadline));
+        if (this.traceEnabled) {
+          this.trace("Deadline: " + (0, deadline_1.deadlineToString)(this.deadline));
+        }
         const timeout = (0, deadline_1.getRelativeTimeout)(this.deadline);
         if (timeout !== Infinity) {
-          this.trace("Deadline will be reached in " + timeout + "ms");
+          if (this.traceEnabled) {
+            this.trace("Deadline will be reached in " + timeout + "ms");
+          }
           const handleDeadline = () => {
             if (!this.deadlineStartTime) {
               this.cancelWithStatus(constants_1.Status.DEADLINE_EXCEEDED, "Deadline exceeded");
@@ -43425,7 +43917,9 @@ var require_resolving_call = __commonJS({
           }
           clearTimeout(this.deadlineTimer);
           const filteredStatus = this.filterStack.receiveTrailers(status);
-          this.trace("ended with status: code=" + filteredStatus.code + ' details="' + filteredStatus.details + '"');
+          if (this.traceEnabled) {
+            this.trace("ended with status: code=" + filteredStatus.code + ' details="' + filteredStatus.details + '"');
+          }
           this.statusWatchers.forEach((watcher) => watcher(filteredStatus));
           process.nextTick(() => {
             var _a;
@@ -43446,7 +43940,8 @@ var require_resolving_call = __commonJS({
             child.halfClose();
           }
         }, (status) => {
-          this.cancelWithStatus(status.code, status.details);
+          var _a, _b;
+          this.cancelWithStatus((_a = status.code) !== null && _a !== void 0 ? _a : constants_1.Status.INTERNAL, (_b = status.details) !== null && _b !== void 0 ? _b : "Failed to write message");
         });
       }
       getConfig() {
@@ -43489,8 +43984,10 @@ var require_resolving_call = __commonJS({
         this.filterStackFactory.push(config.dynamicFilterFactories);
         this.filterStack = this.filterStackFactory.createFilter();
         this.filterStack.sendMetadata(Promise.resolve(this.metadata)).then((filteredMetadata) => {
-          this.child = this.channel.createRetryingCall(config, this.method, this.host, this.credentials, this.deadline);
-          this.trace("Created child [" + this.child.getCallNumber() + "]");
+          this.child = this.channel.createRetryingCall(config, this.method, this.host, this.credentials, this.deadline, this.callNumber);
+          if (this.traceEnabled) {
+            this.trace("Created child [" + this.child.getCallNumber() + "]");
+          }
           this.childStartTime = /* @__PURE__ */ new Date();
           this.child.start(filteredMetadata, {
             onReceiveMetadata: (metadata) => {
@@ -43542,7 +44039,9 @@ var require_resolving_call = __commonJS({
       }
       cancelWithStatus(status, details) {
         var _a;
-        this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+          this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        }
         (_a = this.child) === null || _a === void 0 ? void 0 : _a.cancelWithStatus(status, details);
         this.outputStatus({
           code: status,
@@ -43561,7 +44060,9 @@ var require_resolving_call = __commonJS({
         this.getConfig();
       }
       sendMessageWithContext(context, message) {
-        this.trace("write() called with message of length " + message.length);
+        if (this.traceEnabled) {
+          this.trace("write() called with message of length " + message.length);
+        }
         if (this.child) {
           this.sendMessageOnChild(context, message);
         } else {
@@ -43615,6 +44116,7 @@ var require_retrying_call = __commonJS({
     var deadline_1 = require_deadline();
     var metadata_1 = require_metadata();
     var logging = require_logging();
+    var call_number_1 = require_call_number();
     var TRACER_NAME = "retrying_call";
     var RetryThrottler = class {
       constructor(maxTokens, tokenRatio, previousRetryThrottler) {
@@ -43739,11 +44241,18 @@ var require_retrying_call = __commonJS({
       getCallNumber() {
         return this.callNumber;
       }
+      get traceEnabled() {
+        return logging.isTracerEnabled(TRACER_NAME);
+      }
       trace(text) {
-        logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        if (this.traceEnabled) {
+          logging.trace(constants_1.LogVerbosity.DEBUG, TRACER_NAME, "[" + this.callNumber + "] " + text);
+        }
       }
       reportStatus(statusObject) {
-        this.trace("ended with status: code=" + statusObject.code + ' details="' + statusObject.details + '" start time=' + this.startTime.toISOString());
+        if (this.traceEnabled) {
+          this.trace("ended with status: code=" + statusObject.code + ' details="' + statusObject.details + '" start time=' + this.startTime.toISOString());
+        }
         this.bufferTracker.freeAll(this.callNumber);
         this.writeBufferOffset = this.writeBufferOffset + this.writeBuffer.length;
         this.writeBuffer = [];
@@ -43757,7 +44266,9 @@ var require_retrying_call = __commonJS({
         });
       }
       cancelWithStatus(status, details) {
-        this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        if (this.traceEnabled) {
+          this.trace("cancelWithStatus code: " + status + ' details: "' + details + '"');
+        }
         this.reportStatus({ code: status, details, metadata: new metadata_1.Metadata() });
         for (const { call } of this.underlyingCalls) {
           call.cancelWithStatus(status, details);
@@ -43804,7 +44315,9 @@ var require_retrying_call = __commonJS({
         if (this.state === "COMMITTED") {
           return;
         }
-        this.trace("Committing call [" + this.underlyingCalls[index].call.getCallNumber() + "] at index " + index);
+        if (this.traceEnabled) {
+          this.trace("Committing call [" + this.underlyingCalls[index].call.getCallNumber() + "] at index " + index);
+        }
         this.state = "COMMITTED";
         (_b = (_a = this.callConfig).onCommitted) === null || _b === void 0 ? void 0 : _b.call(_a);
         this.committedCallIndex = index;
@@ -43971,7 +44484,9 @@ var require_retrying_call = __commonJS({
         if (this.underlyingCalls[callIndex].state === "COMPLETED") {
           return;
         }
-        this.trace("state=" + this.state + " handling status with progress " + status.progress + " from child [" + this.underlyingCalls[callIndex].call.getCallNumber() + "] in state " + this.underlyingCalls[callIndex].state);
+        if (this.traceEnabled) {
+          this.trace("state=" + this.state + " handling status with progress " + status.progress + " from child [" + this.underlyingCalls[callIndex].call.getCallNumber() + "] in state " + this.underlyingCalls[callIndex].state);
+        }
         this.underlyingCalls[callIndex].state = "COMPLETED";
         if (status.code === constants_1.Status.OK) {
           (_a = this.retryThrottler) === null || _a === void 0 ? void 0 : _a.addCallSucceeded();
@@ -44047,8 +44562,11 @@ var require_retrying_call = __commonJS({
         (_c = (_b = this.hedgingTimer).unref) === null || _c === void 0 ? void 0 : _c.call(_b);
       }
       startNewAttempt() {
-        const child = this.channel.createLoadBalancingCall(this.callConfig, this.methodName, this.host, this.credentials, this.deadline);
-        this.trace("Created child call [" + child.getCallNumber() + "] for attempt " + this.attempts);
+        const childCallNumber = this.underlyingCalls.length > 0 ? (0, call_number_1.getNextCallNumber)() : this.callNumber;
+        const child = this.channel.createLoadBalancingCall(this.callConfig, this.methodName, this.host, this.credentials, this.deadline, childCallNumber);
+        if (this.traceEnabled) {
+          this.trace("Created child call [" + child.getCallNumber() + "] for attempt " + this.attempts);
+        }
         const index = this.underlyingCalls.length;
         this.underlyingCalls.push({
           state: "ACTIVE",
@@ -44064,7 +44582,9 @@ var require_retrying_call = __commonJS({
         let receivedMetadata = false;
         child.start(initialMetadata, {
           onReceiveMetadata: (metadata) => {
-            this.trace("Received metadata from child [" + child.getCallNumber() + "]");
+            if (this.traceEnabled) {
+              this.trace("Received metadata from child [" + child.getCallNumber() + "]");
+            }
             this.commitCall(index);
             receivedMetadata = true;
             if (previousAttempts > 0) {
@@ -44075,14 +44595,18 @@ var require_retrying_call = __commonJS({
             }
           },
           onReceiveMessage: (message) => {
-            this.trace("Received message from child [" + child.getCallNumber() + "]");
+            if (this.traceEnabled) {
+              this.trace("Received message from child [" + child.getCallNumber() + "]");
+            }
             this.commitCall(index);
             if (this.underlyingCalls[index].state === "ACTIVE") {
               this.listener.onReceiveMessage(message);
             }
           },
           onReceiveStatus: (status) => {
-            this.trace("Received status from child [" + child.getCallNumber() + "]");
+            if (this.traceEnabled) {
+              this.trace("Received status from child [" + child.getCallNumber() + "]");
+            }
             if (!receivedMetadata && previousAttempts > 0) {
               status.metadata.set(PREVIONS_RPC_ATTEMPTS_METADATA_KEY, `${previousAttempts}`);
             }
@@ -44127,7 +44651,9 @@ var require_retrying_call = __commonJS({
               }, bufferEntry.message.message);
               const nextEntry = this.getBufferEntry(messageIndex + 1);
               if (nextEntry.entryType === "HALF_CLOSE") {
-                this.trace("Sending halfClose immediately after message to child [" + childCall.call.getCallNumber() + "] - optimizing for unary/final message");
+                if (this.traceEnabled) {
+                  this.trace("Sending halfClose immediately after message to child [" + childCall.call.getCallNumber() + "] - optimizing for unary/final message");
+                }
                 childCall.nextMessageToSend += 1;
                 childCall.call.halfClose();
               }
@@ -44142,7 +44668,9 @@ var require_retrying_call = __commonJS({
         }
       }
       sendMessageWithContext(context, message) {
-        this.trace("write() called with message of length " + message.length);
+        if (this.traceEnabled) {
+          this.trace("write() called with message of length " + message.length);
+        }
         const writeObj = {
           message,
           flags: context.flags
@@ -44203,7 +44731,9 @@ var require_retrying_call = __commonJS({
         for (const call of this.underlyingCalls) {
           if ((call === null || call === void 0 ? void 0 : call.state) === "ACTIVE") {
             if (call.nextMessageToSend === halfCloseIndex || call.nextMessageToSend === halfCloseIndex - 1) {
-              this.trace("Sending halfClose immediately to child [" + call.call.getCallNumber() + "] - all messages already sent");
+              if (this.traceEnabled) {
+                this.trace("Sending halfClose immediately to child [" + call.call.getCallNumber() + "] - all messages already sent");
+              }
               call.nextMessageToSend += 1;
               call.call.halfClose();
             }
@@ -44433,7 +44963,7 @@ var require_internal_channel = __commonJS({
         this.connectivityState = connectivity_state_1.ConnectivityState.IDLE;
         this.currentPicker = new picker_1.UnavailablePicker();
         this.configSelectionQueue = [];
-        this.pickQueue = [];
+        this.pickQueue = /* @__PURE__ */ new Set();
         this.connectivityStateWatchers = [];
         this.callRefTimer = null;
         this.configSelector = null;
@@ -44500,9 +45030,9 @@ var require_internal_channel = __commonJS({
           },
           updateState: (connectivityState, picker) => {
             this.currentPicker = picker;
-            const queueCopy = this.pickQueue.slice();
-            this.pickQueue = [];
-            if (queueCopy.length > 0) {
+            const queueCopy = this.pickQueue;
+            this.pickQueue = /* @__PURE__ */ new Set();
+            if (queueCopy.size > 0) {
               this.callRefTimerUnref();
             }
             for (const call of queueCopy) {
@@ -44569,15 +45099,22 @@ var require_internal_channel = __commonJS({
         this.filterStackFactory = new filter_stack_1.FilterStackFactory([
           new compression_filter_1.CompressionFilterFactory(this, this.options)
         ]);
-        this.trace("Channel constructed with options " + JSON.stringify(options, void 0, 2));
-        const error2 = new Error();
+        if (this.traceEnabled) {
+          this.trace("Channel constructed with options " + JSON.stringify(options, void 0, 2));
+        }
         if ((0, logging_1.isTracerEnabled)("channel_stacktrace")) {
+          const error2 = new Error();
           (0, logging_1.trace)(constants_1.LogVerbosity.DEBUG, "channel_stacktrace", "(" + this.channelzRef.id + ") Channel constructed \n" + ((_f = error2.stack) === null || _f === void 0 ? void 0 : _f.substring(error2.stack.indexOf("\n") + 1)));
         }
         this.lastActivityTimestamp = /* @__PURE__ */ new Date();
       }
+      get traceEnabled() {
+        return (0, logging_1.isTracerEnabled)("channel");
+      }
       trace(text, verbosityOverride) {
-        (0, logging_1.trace)(verbosityOverride !== null && verbosityOverride !== void 0 ? verbosityOverride : constants_1.LogVerbosity.DEBUG, "channel", "(" + this.channelzRef.id + ") " + (0, uri_parser_1.uriToString)(this.target) + " " + text);
+        if (this.traceEnabled) {
+          (0, logging_1.trace)(verbosityOverride !== null && verbosityOverride !== void 0 ? verbosityOverride : constants_1.LogVerbosity.DEBUG, "channel", "(" + this.channelzRef.id + ") " + (0, uri_parser_1.uriToString)(this.target) + " " + text);
+        }
       }
       callRefTimerRef() {
         var _a, _b, _c, _d;
@@ -44586,14 +45123,18 @@ var require_internal_channel = __commonJS({
           }, MAX_TIMEOUT_TIME);
         }
         if (!((_b = (_a = this.callRefTimer).hasRef) === null || _b === void 0 ? void 0 : _b.call(_a))) {
-          this.trace("callRefTimer.ref | configSelectionQueue.length=" + this.configSelectionQueue.length + " pickQueue.length=" + this.pickQueue.length);
+          if (this.traceEnabled) {
+            this.trace("callRefTimer.ref | configSelectionQueue.length=" + this.configSelectionQueue.length + " pickQueue.length=" + this.pickQueue.size);
+          }
           (_d = (_c = this.callRefTimer).ref) === null || _d === void 0 ? void 0 : _d.call(_c);
         }
       }
       callRefTimerUnref() {
         var _a, _b, _c;
         if (!((_a = this.callRefTimer) === null || _a === void 0 ? void 0 : _a.hasRef) || this.callRefTimer.hasRef()) {
-          this.trace("callRefTimer.unref | configSelectionQueue.length=" + this.configSelectionQueue.length + " pickQueue.length=" + this.pickQueue.length);
+          if (this.traceEnabled) {
+            this.trace("callRefTimer.unref | configSelectionQueue.length=" + this.configSelectionQueue.length + " pickQueue.length=" + this.pickQueue.size);
+          }
           (_c = (_b = this.callRefTimer) === null || _b === void 0 ? void 0 : _b.unref) === null || _c === void 0 ? void 0 : _c.call(_b);
         }
       }
@@ -44645,8 +45186,14 @@ var require_internal_channel = __commonJS({
         });
       }
       queueCallForPick(call) {
-        this.pickQueue.push(call);
+        this.pickQueue.add(call);
         this.callRefTimerRef();
+      }
+      removeCallFromPickQueue(call) {
+        this.pickQueue.delete(call);
+        if (this.pickQueue.size === 0) {
+          this.callRefTimerUnref();
+        }
       }
       getConfig(method, metadata) {
         if (this.connectivityState !== connectivity_state_1.ConnectivityState.SHUTDOWN) {
@@ -44728,19 +45275,25 @@ var require_internal_channel = __commonJS({
         this.lastActivityTimestamp = /* @__PURE__ */ new Date();
         this.maybeStartIdleTimer();
       }
-      createLoadBalancingCall(callConfig, method, host, credentials, deadline) {
-        const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace("createLoadBalancingCall [" + callNumber + '] method="' + method + '"');
-        return new load_balancing_call_1.LoadBalancingCall(this, callConfig, method, host, credentials, deadline, callNumber);
+      createLoadBalancingCall(callConfig, method, host, credentials, deadline, callNumber) {
+        const finalCallNumber = callNumber !== null && callNumber !== void 0 ? callNumber : (0, call_number_1.getNextCallNumber)();
+        if (this.traceEnabled) {
+          this.trace("createLoadBalancingCall [" + finalCallNumber + '] method="' + method + '"');
+        }
+        return new load_balancing_call_1.LoadBalancingCall(this, callConfig, method, host, credentials, deadline, finalCallNumber);
       }
-      createRetryingCall(callConfig, method, host, credentials, deadline) {
-        const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace("createRetryingCall [" + callNumber + '] method="' + method + '"');
-        return new retrying_call_1.RetryingCall(this, callConfig, method, host, credentials, deadline, callNumber, this.retryBufferTracker, RETRY_THROTTLER_MAP.get(this.getTarget()));
+      createRetryingCall(callConfig, method, host, credentials, deadline, callNumber) {
+        const finalCallNumber = callNumber !== null && callNumber !== void 0 ? callNumber : (0, call_number_1.getNextCallNumber)();
+        if (this.traceEnabled) {
+          this.trace("createRetryingCall [" + finalCallNumber + '] method="' + method + '"');
+        }
+        return new retrying_call_1.RetryingCall(this, callConfig, method, host, credentials, deadline, finalCallNumber, this.retryBufferTracker, RETRY_THROTTLER_MAP.get(this.getTarget()));
       }
       createResolvingCall(method, deadline, host, parentCall, propagateFlags) {
         const callNumber = (0, call_number_1.getNextCallNumber)();
-        this.trace("createResolvingCall [" + callNumber + '] method="' + method + '", deadline=' + (0, deadline_1.deadlineToString)(deadline));
+        if (this.traceEnabled) {
+          this.trace("createResolvingCall [" + callNumber + '] method="' + method + '", deadline=' + (0, deadline_1.deadlineToString)(deadline));
+        }
         const finalOptions = {
           deadline,
           flags: propagateFlags !== null && propagateFlags !== void 0 ? propagateFlags : constants_1.Propagate.DEFAULTS,
@@ -44766,7 +45319,7 @@ var require_internal_channel = __commonJS({
         for (const call of this.pickQueue) {
           call.cancelWithStatus(constants_1.Status.UNAVAILABLE, "Channel closed before call started");
         }
-        this.pickQueue = [];
+        this.pickQueue.clear();
         if (this.callRefTimer) {
           clearInterval(this.callRefTimer);
         }
@@ -46474,15 +47027,17 @@ var require_server_interceptors = __commonJS({
       }
       getAuthContext() {
         var _a;
-        if (((_a = this.stream.session) === null || _a === void 0 ? void 0 : _a.socket) instanceof tls_1.TLSSocket) {
-          const peerCertificate = this.stream.session.socket.getPeerCertificate();
-          return {
-            transportSecurityType: "ssl",
-            sslPeerCertificate: peerCertificate.raw ? peerCertificate : void 0
-          };
-        } else {
+        if (!(((_a = this.stream.session) === null || _a === void 0 ? void 0 : _a.socket) instanceof tls_1.TLSSocket)) {
           return {};
         }
+        if (!this.stream.session.socket.authorized) {
+          return {};
+        }
+        const peerCertificate = this.stream.session.socket.getPeerCertificate();
+        return {
+          transportSecurityType: "ssl",
+          sslPeerCertificate: peerCertificate.raw ? peerCertificate : void 0
+        };
       }
       getConnectionInfo() {
         return this.connectionInfo;
@@ -46564,6 +47119,7 @@ var require_server = __commonJS({
     var uri_parser_1 = require_uri_parser();
     var channelz_1 = require_channelz();
     var server_interceptors_1 = require_server_interceptors();
+    var environment_1 = require_environment();
     var UNLIMITED_CONNECTION_AGE_MS = ~(1 << 31);
     var KEEPALIVE_MAX_TIME_MS = ~(1 << 31);
     var KEEPALIVE_TIMEOUT_MS = 2e4;
@@ -47817,9 +48373,15 @@ var require_server = __commonJS({
           try {
             handler.func(stream, respond);
           } catch (err) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+              details = `Server method handler threw error ${err.message}`;
+            } else {
+              details = "Unknown error";
+            }
             call.sendStatus({
               code: constants_1.Status.UNKNOWN,
-              details: `Server method handler threw error ${err.message}`,
+              details,
               metadata: null
             });
           }
@@ -47853,9 +48415,15 @@ var require_server = __commonJS({
           try {
             handler.func(stream, respond);
           } catch (err) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+              details = `Server method handler threw error ${err.message}`;
+            } else {
+              details = "Unknown error";
+            }
             call.sendStatus({
               code: constants_1.Status.UNKNOWN,
-              details: `Server method handler threw error ${err.message}`,
+              details,
               metadata: null
             });
           }
@@ -47909,9 +48477,15 @@ var require_server = __commonJS({
           try {
             handler.func(stream);
           } catch (err) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+              details = `Server method handler threw error ${err.message}`;
+            } else {
+              details = "Unknown error";
+            }
             call.sendStatus({
               code: constants_1.Status.UNKNOWN,
-              details: `Server method handler threw error ${err.message}`,
+              details,
               metadata: null
             });
           }
@@ -47933,9 +48507,15 @@ var require_server = __commonJS({
           try {
             handler.func(stream);
           } catch (err) {
+            let details;
+            if (environment_1.GRPC_NODE_DEBUG_SEND_ERROR_DETAILS) {
+              details = `Server method handler threw error ${err.message}`;
+            } else {
+              details = "Unknown error";
+            }
             call.sendStatus({
               code: constants_1.Status.UNKNOWN,
-              details: `Server method handler threw error ${err.message}`,
+              details,
               metadata: null
             });
           }
@@ -50219,17 +50799,20 @@ var require_extend = __commonJS({
   }
 });
 
-// node_modules/gaxios/package.json
+// node_modules/google-auth-library/node_modules/gaxios/package.json
 var require_package2 = __commonJS({
-  "node_modules/gaxios/package.json"(exports2, module2) {
+  "node_modules/google-auth-library/node_modules/gaxios/package.json"(exports2, module2) {
     module2.exports = {
       name: "gaxios",
-      version: "7.1.4",
+      version: "8.3.1",
       description: "A simple common HTTP client specifically for Google APIs and services.",
       main: "build/cjs/src/index.js",
       types: "build/cjs/src/index.d.ts",
       files: [
-        "build/"
+        "build/cjs/src",
+        "build/esm/src",
+        "build/esm/package.json",
+        "!build/**/*.map"
       ],
       exports: {
         ".": {
@@ -50241,37 +50824,23 @@ var require_package2 = __commonJS({
             types: "./build/cjs/src/index.d.ts",
             default: "./build/cjs/src/index.js"
           }
-        }
-      },
-      scripts: {
-        lint: "gts check --no-inline-config",
-        test: "c8 mocha build/esm/test",
-        "presystem-test": "npm run compile",
-        "system-test": "mocha build/esm/system-test --timeout 80000",
-        compile: "tsc -b ./tsconfig.json ./tsconfig.cjs.json && node utils/enable-esm.mjs",
-        fix: "gts fix",
-        prepare: "npm run compile",
-        pretest: "npm run compile",
-        webpack: "webpack",
-        "prebrowser-test": "npm run compile",
-        "browser-test": "node build/browser-test/browser-test-runner.js",
-        docs: "jsdoc -c .jsdoc.js",
-        "docs-test": "linkinator docs",
-        "predocs-test": "npm run docs",
-        "samples-test": "cd samples/ && npm link ../ && npm test && cd ../",
-        prelint: "cd samples; npm link ../; npm install",
-        clean: "gts clean"
+        },
+        "./build/src/common": {
+          import: "./build/esm/src/common.js",
+          require: "./build/cjs/src/common.js"
+        },
+        "./package.json": "./package.json"
       },
       repository: {
         type: "git",
-        directory: "packages/gaxios",
-        url: "https://github.com/googleapis/google-cloud-node-core.git"
+        directory: "core/packages/gaxios",
+        url: "https://github.com/googleapis/google-cloud-node.git"
       },
       keywords: [
         "google"
       ],
       engines: {
-        node: ">=18"
+        node: ">=22"
       },
       author: "Google, LLC",
       license: "Apache-2.0",
@@ -50284,8 +50853,8 @@ var require_package2 = __commonJS({
         "@types/multiparty": "4.2.1",
         "@types/mv": "^2.1.0",
         "@types/ncp": "^2.0.8",
-        "@types/node": "^22.13.1",
-        "@types/sinon": "^17.0.3",
+        "@types/node": "^24.0.0",
+        "@types/sinon": "^21.0.0",
         "@types/tmp": "^0.2.6",
         assert: "^2.0.0",
         browserify: "^17.0.0",
@@ -50295,8 +50864,8 @@ var require_package2 = __commonJS({
         gts: "^6.0.2",
         "is-docker": "^3.0.0",
         jsdoc: "^4.0.4",
-        "jsdoc-fresh": "^5.0.0",
-        "jsdoc-region-tag": "^4.0.0",
+        "jsdoc-fresh": "^6.0.0",
+        "jsdoc-region-tag": "^5.0.0",
         karma: "^6.0.0",
         "karma-chrome-launcher": "^3.0.0",
         "karma-coverage": "^2.0.0",
@@ -50304,21 +50873,21 @@ var require_package2 = __commonJS({
         "karma-mocha": "^2.0.0",
         "karma-remap-coverage": "^0.1.5",
         "karma-sourcemap-loader": "^0.4.0",
-        "karma-webpack": "^5.0.1",
-        linkinator: "^6.1.2",
+        "karma-webpack": "^5.0.0",
         mocha: "^11.1.0",
         multiparty: "^4.2.1",
         mv: "^2.1.1",
         ncp: "^2.0.0",
-        nock: "^14.0.5",
+        nock: "14.0.5",
         "null-loader": "^4.0.1",
         "pack-n-play": "^4.0.0",
         puppeteer: "^24.0.0",
-        sinon: "^21.0.0",
+        sinon: "21.0.3",
         "stream-browserify": "^3.0.0",
-        tmp: "0.2.5",
+        tmp: "0.2.7",
         "ts-loader": "^9.5.2",
         typescript: "5.8.3",
+        "undici-types": "^7.24.1",
         webpack: "^5.97.1",
         "webpack-cli": "^6.0.1"
       },
@@ -50327,23 +50896,39 @@ var require_package2 = __commonJS({
         "https-proxy-agent": "^7.0.1",
         "node-fetch": "^3.3.2"
       },
-      homepage: "https://github.com/googleapis/google-cloud-node-core/tree/main/packages/gaxios"
+      homepage: "https://github.com/googleapis/google-cloud-node/tree/main/core/packages/gaxios",
+      scripts: {
+        lint: "gts check --no-inline-config",
+        test: "node ../../../bin/run-test.cjs build/esm/test",
+        "presystem-test": "npm run compile",
+        "system-test": "mocha build/esm/system-test --timeout 80000",
+        compile: "tsc -b ./tsconfig.json ./tsconfig.cjs.json && node utils/enable-esm.mjs",
+        fix: "gts fix",
+        pretest: "npm run compile",
+        webpack: "webpack",
+        "prebrowser-test": "npm run compile",
+        "browser-test": "node build/browser-test/browser-test-runner.js",
+        docs: "jsdoc -c .jsdoc.js",
+        "samples-test": "cd samples/ && npm link ../ && npm test && cd ../",
+        prelint: "cd samples; npm link ../; npm install",
+        clean: "gts clean"
+      }
     };
   }
 });
 
-// node_modules/gaxios/build/cjs/src/util.cjs
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/util.cjs
 var require_util11 = __commonJS({
-  "node_modules/gaxios/build/cjs/src/util.cjs"(exports2, module2) {
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/util.cjs"(exports2, module2) {
     "use strict";
     var pkg = require_package2();
     module2.exports = { pkg };
   }
 });
 
-// node_modules/gaxios/build/cjs/src/common.js
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/common.js
 var require_common2 = __commonJS({
-  "node_modules/gaxios/build/cjs/src/common.js"(exports2) {
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/common.js"(exports2) {
     "use strict";
     var __importDefault = exports2 && exports2.__importDefault || function(mod) {
       return mod && mod.__esModule ? mod : { "default": mod };
@@ -50583,9 +51168,9 @@ var require_common2 = __commonJS({
   }
 });
 
-// node_modules/gaxios/build/cjs/src/retry.js
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/retry.js
 var require_retry2 = __commonJS({
-  "node_modules/gaxios/build/cjs/src/retry.js"(exports2) {
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/retry.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.getRetryConfig = getRetryConfig;
@@ -50642,7 +51227,8 @@ var require_retry2 = __commonJS({
     }
     function shouldRetryRequest(err) {
       const config = getConfig(err);
-      if (err.config.signal?.aborted && err.code !== "TimeoutError" || err.code === "AbortError") {
+      const isTimeoutError = err.code === "TimeoutError" || err.config?.signal?.reason?.name === "TimeoutError";
+      if (err.config?.signal?.aborted && !isTimeoutError || err.code === "AbortError" && !isTimeoutError) {
         return false;
       }
       if (!config || config.retry === 0) {
@@ -50688,9 +51274,9 @@ var require_retry2 = __commonJS({
   }
 });
 
-// node_modules/gaxios/build/cjs/src/interceptor.js
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/interceptor.js
 var require_interceptor = __commonJS({
-  "node_modules/gaxios/build/cjs/src/interceptor.js"(exports2) {
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/interceptor.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.GaxiosInterceptorManager = void 0;
@@ -58307,9 +58893,9 @@ var init_src = __esm({
   }
 });
 
-// node_modules/gaxios/build/cjs/src/gaxios.js
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/gaxios.js
 var require_gaxios = __commonJS({
-  "node_modules/gaxios/build/cjs/src/gaxios.js"(exports2) {
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/gaxios.js"(exports2) {
     "use strict";
     var __importDefault = exports2 && exports2.__importDefault || function(mod) {
       return mod && mod.__esModule ? mod : { "default": mod };
@@ -58433,7 +59019,1128 @@ var require_gaxios = __commonJS({
               for await (const chunk of translatedResponse.data) {
                 response.push(chunk);
               }
-              translatedResponse.data = response.toString();
+              translatedResponse.data = Buffer.concat(response.map((c) => typeof c === "string" ? Buffer.from(c) : c)).toString("utf8");
+            }
+            const errorInfo = common_js_1.GaxiosError.extractAPIErrorFromResponse(translatedResponse, `Request failed with status code ${translatedResponse.status}`);
+            throw new common_js_1.GaxiosError(errorInfo?.message, opts, translatedResponse, errorInfo);
+          }
+          return translatedResponse;
+        } catch (e2) {
+          let err;
+          if (e2 instanceof common_js_1.GaxiosError) {
+            err = e2;
+          } else if (e2 instanceof Error) {
+            err = new common_js_1.GaxiosError(e2.message, opts, void 0, e2);
+          } else if (opts.signal?.aborted) {
+            err = new common_js_1.GaxiosError(`The operation was aborted: ${e2}`, opts, void 0, e2);
+            err.code = "AbortError";
+          } else {
+            err = new common_js_1.GaxiosError("Unexpected Gaxios Error", opts, void 0, e2);
+          }
+          if (!err.response && opts.signal?.aborted && opts.signal.reason?.name === "TimeoutError") {
+            err.code = "TimeoutError";
+            if (!/timeout|timed out/i.test(err.message)) {
+              err.message = "The operation was aborted due to timeout";
+            }
+          } else if (!err.response && opts.signal?.aborted && err.code !== "TimeoutError") {
+            err.code ||= "AbortError";
+          }
+          const { shouldRetry, config } = await (0, retry_js_1.getRetryConfig)(err);
+          if (shouldRetry && config) {
+            err.config.retryConfig.currentRetryAttempt = config.retryConfig.currentRetryAttempt;
+            opts.retryConfig = err.config?.retryConfig;
+            if (typeof err.config?.timeout === "number") {
+              opts.timeout = err.config.timeout;
+            }
+            this.#appendTimeoutToSignal(opts);
+            return this._request(opts);
+          }
+          if (opts.errorRedactor) {
+            opts.errorRedactor(err);
+          }
+          throw err;
+        }
+      }
+      async getResponseData(opts, res) {
+        if (res.status === HTTP_STATUS_NO_CONTENT) {
+          return "";
+        }
+        if (opts.maxContentLength && res.headers.has("content-length") && opts.maxContentLength < Number.parseInt(res.headers?.get("content-length") || "")) {
+          throw new common_js_1.GaxiosError("Response's `Content-Length` is over the limit.", opts, Object.assign(res, { config: opts }));
+        }
+        switch (opts.responseType) {
+          case "stream":
+            return res.body;
+          case "json": {
+            const data = await res.text();
+            try {
+              return JSON.parse(data);
+            } catch {
+              return data;
+            }
+          }
+          case "arraybuffer":
+            return res.arrayBuffer();
+          case "blob":
+            return res.blob();
+          case "text":
+            return res.text();
+          default:
+            return this.getResponseDataFromContentType(res);
+        }
+      }
+      #urlMayUseProxy(url, noProxy = []) {
+        const candidate = new URL(url);
+        const noProxyList = [...noProxy];
+        const noProxyEnvList = (process.env.NO_PROXY ?? process.env.no_proxy)?.split(",") || [];
+        for (const rule of noProxyEnvList) {
+          noProxyList.push(rule.trim());
+        }
+        for (const rule of noProxyList) {
+          if (rule instanceof RegExp) {
+            if (rule.test(candidate.toString())) {
+              return false;
+            }
+          } else if (rule instanceof URL) {
+            if (rule.origin === candidate.origin) {
+              return false;
+            }
+          } else if (rule.startsWith("*.") || rule.startsWith(".")) {
+            const cleanedRule = rule.replace(/^\*\./, ".");
+            if (candidate.hostname.endsWith(cleanedRule)) {
+              return false;
+            }
+          } else if (rule === candidate.origin || rule === candidate.hostname || rule === candidate.href) {
+            return false;
+          }
+        }
+        return true;
+      }
+      /**
+       * Applies the request interceptors. The request interceptors are applied after the
+       * call to prepareRequest is completed.
+       *
+       * @param {GaxiosOptionsPrepared} options The current set of options.
+       *
+       * @returns {Promise<GaxiosOptionsPrepared>} Promise that resolves to the set of options or response after interceptors are applied.
+       */
+      async #applyRequestInterceptors(options) {
+        let promiseChain = Promise.resolve(options);
+        for (const interceptor of this.interceptors.request.values()) {
+          if (interceptor) {
+            promiseChain = promiseChain.then(interceptor.resolved, interceptor.rejected);
+          }
+        }
+        return promiseChain;
+      }
+      /**
+       * Applies the response interceptors. The response interceptors are applied after the
+       * call to request is made.
+       *
+       * @param {GaxiosOptionsPrepared} options The current set of options.
+       *
+       * @returns {Promise<GaxiosOptionsPrepared>} Promise that resolves to the set of options or response after interceptors are applied.
+       */
+      async #applyResponseInterceptors(response) {
+        let promiseChain = Promise.resolve(response);
+        for (const interceptor of this.interceptors.response.values()) {
+          if (interceptor) {
+            promiseChain = promiseChain.then(interceptor.resolved, interceptor.rejected);
+          }
+        }
+        return promiseChain;
+      }
+      /**
+       * Validates the options, merges them with defaults, and prepare request.
+       *
+       * @param options The original options passed from the client.
+       * @returns Prepared options, ready to make a request
+       */
+      async #prepareRequest(options) {
+        const preparedHeaders = new Headers(this.defaults.headers);
+        _a.mergeHeaders(preparedHeaders, options.headers);
+        const opts = (0, extend_1.default)(true, {}, this.defaults, options);
+        if (!opts.url) {
+          throw new Error("URL is required.");
+        }
+        if (opts.baseURL) {
+          opts.url = new URL(opts.url, opts.baseURL);
+        }
+        opts.url = new URL(opts.url);
+        if (opts.params) {
+          if (opts.paramsSerializer) {
+            let additionalQueryParams = opts.paramsSerializer(opts.params);
+            if (additionalQueryParams.startsWith("?")) {
+              additionalQueryParams = additionalQueryParams.slice(1);
+            }
+            const prefix = opts.url.toString().includes("?") ? "&" : "?";
+            opts.url = opts.url + prefix + additionalQueryParams;
+          } else {
+            const url = opts.url instanceof URL ? opts.url : new URL(opts.url);
+            for (const [key, value] of new URLSearchParams(opts.params)) {
+              url.searchParams.append(key, value);
+            }
+            opts.url = url;
+          }
+        }
+        if (typeof options.maxContentLength === "number") {
+          opts.size = options.maxContentLength;
+        }
+        if (typeof options.maxRedirects === "number") {
+          opts.follow = options.maxRedirects;
+        }
+        const shouldDirectlyPassData = typeof opts.data === "string" || opts.data instanceof ArrayBuffer || opts.data instanceof Blob || // Node 18 does not have a global `File` object
+        globalThis.File && opts.data instanceof File || opts.data instanceof FormData || opts.data instanceof stream_1.Readable || opts.data instanceof ReadableStream || opts.data instanceof String || opts.data instanceof URLSearchParams || ArrayBuffer.isView(opts.data) || // `Buffer` (Node.js), `DataView`, `TypedArray`
+        /**
+         * @deprecated `node-fetch` or another third-party's request types
+         */
+        ["Blob", "File", "FormData"].includes(opts.data?.constructor?.name || "");
+        if (opts.multipart?.length) {
+          const boundary = await randomUUID2();
+          preparedHeaders.set("content-type", `multipart/related; boundary=${boundary}`);
+          opts.body = stream_1.Readable.from(this.getMultipartRequest(opts.multipart, boundary));
+        } else if (shouldDirectlyPassData) {
+          opts.body = opts.data;
+        } else if (typeof opts.data === "object") {
+          if (preparedHeaders.get("Content-Type") === "application/x-www-form-urlencoded") {
+            opts.body = opts.paramsSerializer ? opts.paramsSerializer(opts.data) : new URLSearchParams(opts.data);
+          } else {
+            if (!preparedHeaders.has("content-type")) {
+              preparedHeaders.set("content-type", "application/json");
+            }
+            opts.body = JSON.stringify(opts.data);
+          }
+        } else if (opts.data) {
+          opts.body = opts.data;
+        }
+        opts.validateStatus = opts.validateStatus || this.validateStatus;
+        opts.responseType = opts.responseType || "unknown";
+        if (!preparedHeaders.has("accept") && opts.responseType === "json") {
+          preparedHeaders.set("accept", "application/json");
+        }
+        const proxy = opts.proxy || process?.env?.HTTPS_PROXY || process?.env?.https_proxy || process?.env?.HTTP_PROXY || process?.env?.http_proxy;
+        if (opts.agent) {
+        } else if (proxy && this.#urlMayUseProxy(opts.url, opts.noProxy)) {
+          const HttpsProxyAgent = await _a.#getProxyAgent();
+          if (this.agentCache.has(proxy)) {
+            opts.agent = this.agentCache.get(proxy);
+          } else {
+            opts.agent = new HttpsProxyAgent(proxy, {
+              cert: opts.cert,
+              key: opts.key
+            });
+            this.agentCache.set(proxy, opts.agent);
+          }
+        } else if (opts.cert && opts.key) {
+          if (this.agentCache.has(opts.key)) {
+            opts.agent = this.agentCache.get(opts.key);
+          } else {
+            opts.agent = new https_1.Agent({
+              cert: opts.cert,
+              key: opts.key
+            });
+            this.agentCache.set(opts.key, opts.agent);
+          }
+        }
+        if (typeof opts.errorRedactor !== "function" && opts.errorRedactor !== false) {
+          opts.errorRedactor = common_js_1.defaultErrorRedactor;
+        }
+        if (opts.body && !("duplex" in opts)) {
+          opts.duplex = "half";
+        }
+        this.#appendTimeoutToSignal(opts);
+        return Object.assign(opts, {
+          headers: preparedHeaders,
+          url: opts.url instanceof URL ? opts.url : new URL(opts.url)
+        });
+      }
+      #callerSignals = /* @__PURE__ */ new WeakMap();
+      #appendTimeoutToSignal(opts) {
+        if (opts.timeout) {
+          if (!this.#callerSignals.has(opts)) {
+            this.#callerSignals.set(opts, opts.signal ?? void 0);
+          }
+          const callerSignal = this.#callerSignals.get(opts);
+          const timeoutSignal = AbortSignal.timeout(opts.timeout);
+          if (callerSignal) {
+            opts.signal = AbortSignal.any([callerSignal, timeoutSignal]);
+          } else {
+            opts.signal = timeoutSignal;
+          }
+        }
+      }
+      /**
+       * By default, throw for any non-2xx status code
+       * @param status status code from the HTTP response
+       */
+      validateStatus(status) {
+        return status >= 200 && status < 300;
+      }
+      /**
+       * Attempts to parse a response by looking at the Content-Type header.
+       * @param {Response} response the HTTP response.
+       * @returns a promise that resolves to the response data.
+       */
+      async getResponseDataFromContentType(response) {
+        let contentType = response.headers.get("Content-Type");
+        if (contentType === null) {
+          return response.text();
+        }
+        contentType = contentType.toLowerCase();
+        if (contentType.includes("application/json")) {
+          let data = await response.text();
+          try {
+            data = JSON.parse(data);
+          } catch {
+          }
+          return data;
+        } else if (contentType.match(/^text\//)) {
+          return response.text();
+        } else {
+          return response.blob();
+        }
+      }
+      /**
+       * Creates an async generator that yields the pieces of a multipart/related request body.
+       * This implementation follows the spec: https://www.ietf.org/rfc/rfc2387.txt. However, recursive
+       * multipart/related requests are not currently supported.
+       *
+       * @param {GaxiosMultipartOptions[]} multipartOptions the pieces to turn into a multipart/related body.
+       * @param {string} boundary the boundary string to be placed between each part.
+       */
+      async *getMultipartRequest(multipartOptions, boundary) {
+        const finale = `--${boundary}--`;
+        for (const currentPart of multipartOptions) {
+          const partContentType = currentPart.headers.get("Content-Type") || "application/octet-stream";
+          const preamble = `--${boundary}\r
+Content-Type: ${partContentType}\r
+\r
+`;
+          yield preamble;
+          if (typeof currentPart.content === "string") {
+            yield currentPart.content;
+          } else {
+            yield* currentPart.content;
+          }
+          yield "\r\n";
+        }
+        yield finale;
+      }
+      /**
+       * A cache for the lazily-loaded proxy agent.
+       *
+       * Should use {@link Gaxios[#getProxyAgent]} to retrieve.
+       */
+      // using `import` to dynamically import the types here
+      static #proxyAgent;
+      /**
+       * A cache for the lazily-loaded fetch library.
+       *
+       * Should use {@link Gaxios[#getFetch]} to retrieve.
+       */
+      //
+      static #fetch;
+      static #bunFetch;
+      /**
+       * Imports, caches, and returns a proxy agent - if not already imported
+       *
+       * @returns A proxy agent
+       */
+      static async #getProxyAgent() {
+        this.#proxyAgent ||= (await Promise.resolve().then(() => __toESM(require_dist2()))).HttpsProxyAgent;
+        return this.#proxyAgent;
+      }
+      static #createBunFetch() {
+        return async (input, init) => {
+          const rawInit = init ? { ...init } : void 0;
+          if (rawInit) {
+            const proxyAgent = rawInit.agent;
+            if (proxyAgent?.proxy) {
+              rawInit.proxy = proxyAgent.proxy.toString();
+            } else {
+              delete rawInit.proxy;
+            }
+            const cert = rawInit.cert ?? proxyAgent?.connectOpts?.cert;
+            const key = rawInit.key ?? proxyAgent?.connectOpts?.key;
+            if (cert && key) {
+              rawInit.tls = {
+                ...rawInit.tls,
+                cert,
+                key
+              };
+            }
+          }
+          let fetchInit = rawInit;
+          if (fetchInit?.body && typeof fetchInit.body === "object" && typeof fetchInit.body.pipe === "function" && typeof stream_1.Readable.toWeb === "function" && (typeof ReadableStream === "undefined" || !(fetchInit.body instanceof ReadableStream))) {
+            let stream;
+            if (fetchInit.body instanceof stream_1.Readable && !fetchInit.body.readableObjectMode) {
+              stream = fetchInit.body;
+            } else {
+              const passThrough = new stream_1.PassThrough();
+              const src = fetchInit.body;
+              (0, stream_1.pipeline)(src, passThrough, () => {
+              });
+              stream = passThrough;
+            }
+            fetchInit = {
+              ...fetchInit,
+              body: stream_1.Readable.toWeb(stream)
+            };
+          }
+          let res;
+          try {
+            res = await globalThis.fetch(input, fetchInit);
+          } catch (err) {
+            const errorObj = err;
+            if (errorObj?.code === "ConnectionRefused" || errorObj?.code === "FailedToOpenSocket") {
+              errorObj.code = "ECONNREFUSED";
+            } else if (errorObj?.code === "ConnectionReset" || errorObj?.code === "ConnectionClosed") {
+              errorObj.code = "ECONNRESET";
+            }
+            if (!(err instanceof Error) && err && typeof err === "object" && !init?.signal?.aborted) {
+              throw Object.assign(new Error(errorObj.message || errorObj.code || "Error"), err);
+            }
+            throw err;
+          }
+          if (res?.body && typeof stream_1.Readable.fromWeb === "function" && !(res.body instanceof stream_1.Readable)) {
+            let nodeStream;
+            const rawBody = res.body;
+            const origText = res.text.bind(res);
+            const origJson = res.json.bind(res);
+            const origArrayBuffer = res.arrayBuffer.bind(res);
+            const origBlob = res.blob.bind(res);
+            const readBuffer = async () => {
+              const chunks = [];
+              for await (const chunk of nodeStream) {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+              }
+              return Buffer.concat(chunks);
+            };
+            Object.defineProperty(res, "body", {
+              get() {
+                nodeStream ||= stream_1.Readable.fromWeb(rawBody);
+                return nodeStream;
+              },
+              configurable: true,
+              enumerable: true
+            });
+            res.text = async () => {
+              if (!nodeStream)
+                return origText();
+              return (await readBuffer()).toString("utf8");
+            };
+            res.json = async () => {
+              if (!nodeStream)
+                return origJson();
+              return JSON.parse(await res.text());
+            };
+            res.arrayBuffer = async () => {
+              if (!nodeStream)
+                return origArrayBuffer();
+              const buf = await readBuffer();
+              return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+            };
+            res.blob = async () => {
+              if (!nodeStream)
+                return origBlob();
+              const buf = await readBuffer();
+              const contentType = res.headers?.get?.("content-type") ?? "";
+              return new Blob([buf], contentType ? { type: contentType } : void 0);
+            };
+          }
+          return res;
+        };
+      }
+      static async #getFetch() {
+        const hasWindow = typeof window !== "undefined" && !!window;
+        if (hasWindow) {
+          this.#fetch ||= window.fetch;
+          return this.#fetch;
+        }
+        if ("Bun" in globalThis && typeof globalThis.fetch === "function") {
+          this.#bunFetch ||= this.#createBunFetch();
+          return this.#bunFetch;
+        }
+        this.#fetch ||= (await Promise.resolve().then(() => (init_src(), src_exports))).default;
+        return this.#fetch;
+      }
+      /**
+       * Merges headers.
+       * If the base headers do not exist a new `Headers` object will be returned.
+       *
+       * @remarks
+       *
+       * Using this utility can be helpful when the headers are not known to exist:
+       * - if they exist as `Headers`, that instance will be used
+       *   - it improves performance and allows users to use their existing references to their `Headers`
+       * - if they exist in another form (`HeadersInit`), they will be used to create a new `Headers` object
+       * - if the base headers do not exist a new `Headers` object will be created
+       *
+       * @param base headers to append/overwrite to
+       * @param append headers to append/overwrite with
+       * @returns the base headers instance with merged `Headers`
+       */
+      static mergeHeaders(base, ...append) {
+        base = base instanceof Headers ? base : new Headers(base);
+        for (const headers of append) {
+          const add = headers instanceof Headers ? headers : new Headers(headers);
+          add.forEach((value, key) => {
+            key === "set-cookie" ? base.append(key, value) : base.set(key, value);
+          });
+        }
+        return base;
+      }
+    };
+    exports2.Gaxios = Gaxios;
+    _a = Gaxios;
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/index.js
+var require_src5 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gaxios/build/cjs/src/index.js"(exports2) {
+    "use strict";
+    var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
+      if (k2 === void 0) k2 = k;
+      var desc = Object.getOwnPropertyDescriptor(m2, k);
+      if (!desc || ("get" in desc ? !m2.__esModule : desc.writable || desc.configurable)) {
+        desc = { enumerable: true, get: function() {
+          return m2[k];
+        } };
+      }
+      Object.defineProperty(o, k2, desc);
+    }) : (function(o, m2, k, k2) {
+      if (k2 === void 0) k2 = k;
+      o[k2] = m2[k];
+    }));
+    var __exportStar = exports2 && exports2.__exportStar || function(m2, exports3) {
+      for (var p in m2) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports3, p)) __createBinding(exports3, m2, p);
+    };
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.instance = exports2.Gaxios = exports2.GaxiosError = void 0;
+    exports2.request = request;
+    var gaxios_js_1 = require_gaxios();
+    Object.defineProperty(exports2, "Gaxios", { enumerable: true, get: function() {
+      return gaxios_js_1.Gaxios;
+    } });
+    var common_js_1 = require_common2();
+    Object.defineProperty(exports2, "GaxiosError", { enumerable: true, get: function() {
+      return common_js_1.GaxiosError;
+    } });
+    __exportStar(require_interceptor(), exports2);
+    exports2.instance = new gaxios_js_1.Gaxios();
+    async function request(opts) {
+      return exports2.instance.request(opts);
+    }
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/package.json
+var require_package3 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/package.json"(exports2, module2) {
+    module2.exports = {
+      name: "gaxios",
+      version: "7.3.1",
+      description: "A simple common HTTP client specifically for Google APIs and services.",
+      main: "build/cjs/src/index.js",
+      types: "build/cjs/src/index.d.ts",
+      files: [
+        "build/"
+      ],
+      exports: {
+        ".": {
+          import: {
+            types: "./build/esm/src/index.d.ts",
+            default: "./build/esm/src/index.js"
+          },
+          require: {
+            types: "./build/cjs/src/index.d.ts",
+            default: "./build/cjs/src/index.js"
+          }
+        }
+      },
+      scripts: {
+        lint: "gts check --no-inline-config",
+        test: "c8 mocha build/esm/test",
+        "presystem-test": "npm run compile",
+        "system-test": "mocha build/esm/system-test --timeout 80000",
+        compile: "tsc -b ./tsconfig.json ./tsconfig.cjs.json && node utils/enable-esm.mjs",
+        fix: "gts fix",
+        prepare: "npm run compile",
+        pretest: "npm run compile",
+        webpack: "webpack",
+        "prebrowser-test": "npm run compile",
+        "browser-test": "node build/browser-test/browser-test-runner.js",
+        docs: "jsdoc -c .jsdoc.js",
+        "samples-test": "cd samples/ && npm link ../ && npm test && cd ../",
+        prelint: "cd samples; npm link ../; npm install",
+        clean: "gts clean"
+      },
+      repository: {
+        type: "git",
+        directory: "core/packages/gaxios",
+        url: "https://github.com/googleapis/google-cloud-node.git"
+      },
+      keywords: [
+        "google"
+      ],
+      engines: {
+        node: ">=18"
+      },
+      author: "Google, LLC",
+      license: "Apache-2.0",
+      devDependencies: {
+        "@babel/plugin-proposal-private-methods": "^7.18.6",
+        "@types/cors": "^2.8.6",
+        "@types/express": "^5.0.0",
+        "@types/extend": "^3.0.1",
+        "@types/mocha": "^10.0.10",
+        "@types/multiparty": "4.2.1",
+        "@types/mv": "^2.1.0",
+        "@types/ncp": "^2.0.8",
+        "@types/node": "^24.0.0",
+        "@types/sinon": "^21.0.0",
+        "@types/tmp": "^0.2.6",
+        assert: "^2.0.0",
+        browserify: "^17.0.0",
+        c8: "^10.1.3",
+        cors: "^2.8.5",
+        express: "^5.0.0",
+        gts: "^6.0.2",
+        "is-docker": "^3.0.0",
+        jsdoc: "^4.0.4",
+        "jsdoc-fresh": "^5.0.0",
+        "jsdoc-region-tag": "^4.0.0",
+        karma: "^6.0.0",
+        "karma-chrome-launcher": "^3.0.0",
+        "karma-coverage": "^2.0.0",
+        "karma-firefox-launcher": "^2.0.0",
+        "karma-mocha": "^2.0.0",
+        "karma-remap-coverage": "^0.1.5",
+        "karma-sourcemap-loader": "^0.4.0",
+        "karma-webpack": "^5.0.0",
+        mocha: "^11.1.0",
+        multiparty: "^4.2.1",
+        mv: "^2.1.1",
+        ncp: "^2.0.0",
+        nock: "14.0.5",
+        "null-loader": "^4.0.1",
+        "pack-n-play": "^4.0.0",
+        puppeteer: "^24.0.0",
+        sinon: "21.0.3",
+        "stream-browserify": "^3.0.0",
+        tmp: "0.2.7",
+        "ts-loader": "^9.5.2",
+        typescript: "5.8.3",
+        "undici-types": "^7.24.1",
+        webpack: "^5.97.1",
+        "webpack-cli": "^6.0.1"
+      },
+      dependencies: {
+        extend: "^3.0.2",
+        "https-proxy-agent": "^7.0.1",
+        "node-fetch": "^3.3.2"
+      },
+      homepage: "https://github.com/googleapis/google-cloud-node/tree/main/core/packages/gaxios"
+    };
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/util.cjs
+var require_util12 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/util.cjs"(exports2, module2) {
+    "use strict";
+    var pkg = require_package3();
+    module2.exports = { pkg };
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/common.js
+var require_common4 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/common.js"(exports2) {
+    "use strict";
+    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
+      return mod && mod.__esModule ? mod : { "default": mod };
+    };
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.GaxiosError = exports2.GAXIOS_ERROR_SYMBOL = void 0;
+    exports2.defaultErrorRedactor = defaultErrorRedactor;
+    var extend_1 = __importDefault(require_extend());
+    var util_cjs_1 = __importDefault(require_util12());
+    var pkg = util_cjs_1.default.pkg;
+    exports2.GAXIOS_ERROR_SYMBOL = /* @__PURE__ */ Symbol.for(`${pkg.name}-gaxios-error`);
+    var GaxiosError = class _GaxiosError extends Error {
+      config;
+      response;
+      /**
+       * An error code.
+       * Can be a system error code, DOMException error name, or any error's 'code' property where it is a `string`.
+       *
+       * It is only a `number` when the cause is sourced from an API-level error (AIP-193).
+       *
+       * @see {@link https://nodejs.org/api/errors.html#errorcode error.code}
+       * @see {@link https://developer.mozilla.org/en-US/docs/Web/API/DOMException#error_names DOMException#error_names}
+       * @see {@link https://google.aip.dev/193#http11json-representation AIP-193}
+       *
+       * @example
+       * 'ECONNRESET'
+       *
+       * @example
+       * 'TimeoutError'
+       *
+       * @example
+       * 500
+       */
+      code;
+      /**
+       * An HTTP Status code.
+       * @see {@link https://developer.mozilla.org/en-US/docs/Web/API/Response/status Response#status}
+       *
+       * @example
+       * 500
+       */
+      status;
+      /**
+       * @deprecated use {@link GaxiosError.cause} instead.
+       *
+       * @see {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error/cause Error#cause}
+       *
+       * @privateRemarks
+       *
+       * We will want to remove this property later as the modern `cause` property is better suited
+       * for displaying and relaying nested errors. Keeping this here makes the resulting
+       * error log larger than it needs to be.
+       *
+       */
+      error;
+      /**
+       * Support `instanceof` operator for `GaxiosError` across builds/duplicated files.
+       *
+       * @see {@link GAXIOS_ERROR_SYMBOL}
+       * @see {@link GaxiosError[Symbol.hasInstance]}
+       * @see {@link https://github.com/microsoft/TypeScript/issues/13965#issuecomment-278570200}
+       * @see {@link https://stackoverflow.com/questions/46618852/require-and-instanceof}
+       * @see {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/@@hasInstance#reverting_to_default_instanceof_behavior}
+       */
+      [exports2.GAXIOS_ERROR_SYMBOL] = pkg.version;
+      /**
+       * Support `instanceof` operator for `GaxiosError` across builds/duplicated files.
+       *
+       * @see {@link GAXIOS_ERROR_SYMBOL}
+       * @see {@link GaxiosError[GAXIOS_ERROR_SYMBOL]}
+       */
+      static [Symbol.hasInstance](instance) {
+        if (instance && typeof instance === "object" && exports2.GAXIOS_ERROR_SYMBOL in instance && instance[exports2.GAXIOS_ERROR_SYMBOL] === pkg.version) {
+          return true;
+        }
+        return Function.prototype[Symbol.hasInstance].call(_GaxiosError, instance);
+      }
+      constructor(message, config, response, cause) {
+        super(message, { cause });
+        this.config = config;
+        this.response = response;
+        this.error = cause instanceof Error ? cause : void 0;
+        this.config = (0, extend_1.default)(true, {}, config);
+        if (this.response) {
+          this.response.config = (0, extend_1.default)(true, {}, this.response.config);
+        }
+        if (this.response) {
+          try {
+            this.response.data = translateData(
+              this.config.responseType,
+              // workaround for `node-fetch`'s `.data` deprecation...
+              this.response?.bodyUsed ? this.response?.data : void 0
+            );
+          } catch {
+          }
+          this.status = this.response.status;
+        }
+        if (cause instanceof DOMException) {
+          this.code = cause.name;
+        } else if (cause && typeof cause === "object" && "code" in cause && (typeof cause.code === "string" || typeof cause.code === "number")) {
+          this.code = cause.code;
+        }
+      }
+      /**
+       * An AIP-193 conforming error extractor.
+       *
+       * @see {@link https://google.aip.dev/193#http11json-representation AIP-193}
+       *
+       * @internal
+       * @expiremental
+       *
+       * @param res the response object
+       * @returns the extracted error information
+       */
+      static extractAPIErrorFromResponse(res, defaultErrorMessage = "The request failed") {
+        let message = defaultErrorMessage;
+        if (typeof res.data === "string") {
+          message = res.data;
+        }
+        if (res.data && typeof res.data === "object" && "error" in res.data && res.data.error && !res.ok) {
+          if (typeof res.data.error === "string") {
+            return {
+              message: res.data.error,
+              code: res.status,
+              status: res.statusText
+            };
+          }
+          if (typeof res.data.error === "object") {
+            message = "message" in res.data.error && typeof res.data.error.message === "string" ? res.data.error.message : message;
+            const status = "status" in res.data.error && typeof res.data.error.status === "string" ? res.data.error.status : res.statusText;
+            const code = "code" in res.data.error && typeof res.data.error.code === "number" ? res.data.error.code : res.status;
+            if ("errors" in res.data.error && Array.isArray(res.data.error.errors)) {
+              const errorMessages = [];
+              for (const e2 of res.data.error.errors) {
+                if (typeof e2 === "object" && "message" in e2 && typeof e2.message === "string") {
+                  errorMessages.push(e2.message);
+                }
+              }
+              return Object.assign({
+                message: errorMessages.join("\n") || message,
+                code,
+                status
+              }, res.data.error);
+            }
+            return Object.assign({
+              message,
+              code,
+              status
+            }, res.data.error);
+          }
+        }
+        return {
+          message,
+          code: res.status,
+          status: res.statusText
+        };
+      }
+    };
+    exports2.GaxiosError = GaxiosError;
+    function translateData(responseType, data) {
+      switch (responseType) {
+        case "stream":
+          return data;
+        case "json":
+          return JSON.parse(JSON.stringify(data));
+        case "arraybuffer":
+          return JSON.parse(Buffer.from(data).toString("utf8"));
+        case "blob":
+          return JSON.parse(data.text());
+        default:
+          return data;
+      }
+    }
+    function defaultErrorRedactor(data) {
+      const REDACT = "<<REDACTED> - See `errorRedactor` option in `gaxios` for configuration>.";
+      function redactHeaders(headers) {
+        if (!headers)
+          return;
+        headers.forEach((_, key) => {
+          if (/^authentication$/i.test(key) || /^authorization$/i.test(key) || /secret/i.test(key))
+            headers.set(key, REDACT);
+        });
+      }
+      function redactString(obj, key) {
+        if (typeof obj === "object" && obj !== null && typeof obj[key] === "string") {
+          const text = obj[key];
+          if (/grant_type=/i.test(text) || /assertion=/i.test(text) || /secret/i.test(text)) {
+            obj[key] = REDACT;
+          }
+        }
+      }
+      function redactObject(obj) {
+        if (!obj || typeof obj !== "object") {
+          return;
+        } else if (obj instanceof FormData || obj instanceof URLSearchParams || // support `node-fetch` FormData/URLSearchParams
+        "forEach" in obj && "set" in obj) {
+          obj.forEach((_, key) => {
+            if (["grant_type", "assertion"].includes(key) || /secret/.test(key)) {
+              obj.set(key, REDACT);
+            }
+          });
+        } else {
+          if ("grant_type" in obj) {
+            obj["grant_type"] = REDACT;
+          }
+          if ("assertion" in obj) {
+            obj["assertion"] = REDACT;
+          }
+          if ("client_secret" in obj) {
+            obj["client_secret"] = REDACT;
+          }
+        }
+      }
+      if (data.config) {
+        redactHeaders(data.config.headers);
+        redactString(data.config, "data");
+        redactObject(data.config.data);
+        redactString(data.config, "body");
+        redactObject(data.config.body);
+        if (data.config.url.searchParams.has("token")) {
+          data.config.url.searchParams.set("token", REDACT);
+        }
+        if (data.config.url.searchParams.has("client_secret")) {
+          data.config.url.searchParams.set("client_secret", REDACT);
+        }
+      }
+      if (data.response) {
+        defaultErrorRedactor({ config: data.response.config });
+        redactHeaders(data.response.headers);
+        if (data.response.bodyUsed) {
+          redactString(data.response, "data");
+          redactObject(data.response.data);
+        }
+      }
+      return data;
+    }
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/retry.js
+var require_retry3 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/retry.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.getRetryConfig = getRetryConfig;
+    async function getRetryConfig(err) {
+      let config = getConfig(err);
+      if (!err || !err.config || !config && !err.config.retry) {
+        return { shouldRetry: false };
+      }
+      config = config || {};
+      config.currentRetryAttempt = config.currentRetryAttempt || 0;
+      config.retry = config.retry === void 0 || config.retry === null ? 3 : config.retry;
+      config.httpMethodsToRetry = config.httpMethodsToRetry || [
+        "GET",
+        "HEAD",
+        "PUT",
+        "OPTIONS",
+        "DELETE"
+      ];
+      config.noResponseRetries = config.noResponseRetries === void 0 || config.noResponseRetries === null ? 2 : config.noResponseRetries;
+      config.retryDelayMultiplier = config.retryDelayMultiplier ? config.retryDelayMultiplier : 2;
+      config.timeOfFirstRequest = config.timeOfFirstRequest ? config.timeOfFirstRequest : Date.now();
+      config.totalTimeout = config.totalTimeout ? config.totalTimeout : Number.MAX_SAFE_INTEGER;
+      config.maxRetryDelay = config.maxRetryDelay ? config.maxRetryDelay : Number.MAX_SAFE_INTEGER;
+      const retryRanges = [
+        // https://en.wikipedia.org/wiki/List_of_HTTP_status_codes
+        // 1xx - Retry (Informational, request still processing)
+        // 2xx - Do not retry (Success)
+        // 3xx - Do not retry (Redirect)
+        // 4xx - Do not retry (Client errors)
+        // 408 - Retry ("Request Timeout")
+        // 429 - Retry ("Too Many Requests")
+        // 5xx - Retry (Server errors)
+        [100, 199],
+        [408, 408],
+        [429, 429],
+        [500, 599]
+      ];
+      config.statusCodesToRetry = config.statusCodesToRetry || retryRanges;
+      err.config.retryConfig = config;
+      const shouldRetryFn = config.shouldRetry || shouldRetryRequest;
+      if (!await shouldRetryFn(err)) {
+        return { shouldRetry: false, config: err.config };
+      }
+      const delay = getNextRetryDelay(config);
+      err.config.retryConfig.currentRetryAttempt += 1;
+      const backoff = config.retryBackoff ? config.retryBackoff(err, delay) : new Promise((resolve) => {
+        setTimeout(resolve, delay);
+      });
+      if (config.onRetryAttempt) {
+        await config.onRetryAttempt(err);
+      }
+      await backoff;
+      return { shouldRetry: true, config: err.config };
+    }
+    function shouldRetryRequest(err) {
+      const config = getConfig(err);
+      if (err.config.signal?.aborted && err.code !== "TimeoutError" || err.code === "AbortError") {
+        return false;
+      }
+      if (!config || config.retry === 0) {
+        return false;
+      }
+      if (!err.response && (config.currentRetryAttempt || 0) >= config.noResponseRetries) {
+        return false;
+      }
+      if (!config.httpMethodsToRetry || !config.httpMethodsToRetry.includes(err.config.method?.toUpperCase() || "GET")) {
+        return false;
+      }
+      if (err.response && err.response.status) {
+        let isInRange = false;
+        for (const [min, max] of config.statusCodesToRetry) {
+          const status = err.response.status;
+          if (status >= min && status <= max) {
+            isInRange = true;
+            break;
+          }
+        }
+        if (!isInRange) {
+          return false;
+        }
+      }
+      config.currentRetryAttempt = config.currentRetryAttempt || 0;
+      if (config.currentRetryAttempt >= config.retry) {
+        return false;
+      }
+      return true;
+    }
+    function getConfig(err) {
+      if (err && err.config && err.config.retryConfig) {
+        return err.config.retryConfig;
+      }
+      return;
+    }
+    function getNextRetryDelay(config) {
+      const retryDelay = config.currentRetryAttempt ? 0 : config.retryDelay ?? 100;
+      const calculatedDelay = retryDelay + (Math.pow(config.retryDelayMultiplier, config.currentRetryAttempt) - 1) / 2 * 1e3;
+      const maxAllowableDelay = config.totalTimeout - (Date.now() - config.timeOfFirstRequest);
+      return Math.min(calculatedDelay, maxAllowableDelay, config.maxRetryDelay);
+    }
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/interceptor.js
+var require_interceptor2 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/interceptor.js"(exports2) {
+    "use strict";
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.GaxiosInterceptorManager = void 0;
+    var GaxiosInterceptorManager = class extends Set {
+    };
+    exports2.GaxiosInterceptorManager = GaxiosInterceptorManager;
+  }
+});
+
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/gaxios.js
+var require_gaxios2 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/gaxios.js"(exports2) {
+    "use strict";
+    var __importDefault = exports2 && exports2.__importDefault || function(mod) {
+      return mod && mod.__esModule ? mod : { "default": mod };
+    };
+    var _a;
+    Object.defineProperty(exports2, "__esModule", { value: true });
+    exports2.Gaxios = void 0;
+    var extend_1 = __importDefault(require_extend());
+    var https_1 = require("https");
+    var common_js_1 = require_common4();
+    var retry_js_1 = require_retry3();
+    var stream_1 = require("stream");
+    var interceptor_js_1 = require_interceptor2();
+    var randomUUID2 = async () => globalThis.crypto?.randomUUID() || (await import("crypto")).randomUUID();
+    var HTTP_STATUS_NO_CONTENT = 204;
+    var Gaxios = class {
+      agentCache = /* @__PURE__ */ new Map();
+      /**
+       * Default HTTP options that will be used for every HTTP request.
+       */
+      defaults;
+      /**
+       * Interceptors
+       */
+      interceptors;
+      /**
+       * The Gaxios class is responsible for making HTTP requests.
+       * @param defaults The default set of options to be used for this instance.
+       */
+      constructor(defaults) {
+        this.defaults = defaults || {};
+        this.interceptors = {
+          request: new interceptor_js_1.GaxiosInterceptorManager(),
+          response: new interceptor_js_1.GaxiosInterceptorManager()
+        };
+      }
+      /**
+       * A {@link fetch `fetch`} compliant API for {@link Gaxios}.
+       *
+       * @remarks
+       *
+       * This is useful as a drop-in replacement for `fetch` API usage.
+       *
+       * @example
+       *
+       * ```ts
+       * const gaxios = new Gaxios();
+       * const myFetch: typeof fetch = (...args) => gaxios.fetch(...args);
+       * await myFetch('https://example.com');
+       * ```
+       *
+       * @param args `fetch` API or `Gaxios#request` parameters
+       * @returns the {@link Response} with Gaxios-added properties
+       */
+      fetch(...args) {
+        const input = args[0];
+        const init = args[1];
+        let url = void 0;
+        const headers = new Headers();
+        if (typeof input === "string") {
+          url = new URL(input);
+        } else if (input instanceof URL) {
+          url = input;
+        } else if (input && input.url) {
+          url = new URL(input.url);
+        }
+        if (input && typeof input === "object" && "headers" in input) {
+          _a.mergeHeaders(headers, input.headers);
+        }
+        if (init) {
+          _a.mergeHeaders(headers, new Headers(init.headers));
+        }
+        if (typeof input === "object" && !(input instanceof URL)) {
+          return this.request({ ...init, ...input, headers, url });
+        } else {
+          return this.request({ ...init, headers, url });
+        }
+      }
+      /**
+       * Perform an HTTP request with the given options.
+       * @param opts Set of HTTP options that will be used for this HTTP request.
+       */
+      async request(opts = {}) {
+        let prepared = await this.#prepareRequest(opts);
+        prepared = await this.#applyRequestInterceptors(prepared);
+        return this.#applyResponseInterceptors(this._request(prepared));
+      }
+      async _defaultAdapter(config) {
+        const fetchImpl = config.fetchImplementation || this.defaults.fetchImplementation || await _a.#getFetch();
+        const preparedOpts = { ...config };
+        delete preparedOpts.data;
+        const res = await fetchImpl(config.url, preparedOpts);
+        const data = await this.getResponseData(config, res);
+        if (!Object.getOwnPropertyDescriptor(res, "data")?.configurable) {
+          Object.defineProperties(res, {
+            data: {
+              configurable: true,
+              writable: true,
+              enumerable: true,
+              value: data
+            }
+          });
+        }
+        return Object.assign(res, { config, data });
+      }
+      /**
+       * Internal, retryable version of the `request` method.
+       * @param opts Set of HTTP options that will be used for this HTTP request.
+       */
+      async _request(opts) {
+        try {
+          let translatedResponse;
+          if (opts.adapter) {
+            translatedResponse = await opts.adapter(opts, this._defaultAdapter.bind(this));
+          } else {
+            translatedResponse = await this._defaultAdapter(opts);
+          }
+          if (!opts.validateStatus(translatedResponse.status)) {
+            if (opts.responseType === "stream") {
+              const response = [];
+              for await (const chunk of translatedResponse.data) {
+                response.push(chunk);
+              }
+              translatedResponse.data = Buffer.concat(response.map((c) => typeof c === "string" ? Buffer.from(c) : c)).toString("utf8");
             }
             const errorInfo = common_js_1.GaxiosError.extractAPIErrorFromResponse(translatedResponse, `Request failed with status code ${translatedResponse.status}`);
             throw new common_js_1.GaxiosError(errorInfo?.message, opts, translatedResponse, errorInfo);
@@ -58781,9 +60488,9 @@ Content-Type: ${partContentType}\r
   }
 });
 
-// node_modules/gaxios/build/cjs/src/index.js
-var require_src5 = __commonJS({
-  "node_modules/gaxios/build/cjs/src/index.js"(exports2) {
+// node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/index.js
+var require_src6 = __commonJS({
+  "node_modules/google-auth-library/node_modules/gcp-metadata/node_modules/gaxios/build/cjs/src/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
       if (k2 === void 0) k2 = k;
@@ -58804,15 +60511,15 @@ var require_src5 = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.instance = exports2.Gaxios = exports2.GaxiosError = void 0;
     exports2.request = request;
-    var gaxios_js_1 = require_gaxios();
+    var gaxios_js_1 = require_gaxios2();
     Object.defineProperty(exports2, "Gaxios", { enumerable: true, get: function() {
       return gaxios_js_1.Gaxios;
     } });
-    var common_js_1 = require_common2();
+    var common_js_1 = require_common4();
     Object.defineProperty(exports2, "GaxiosError", { enumerable: true, get: function() {
       return common_js_1.GaxiosError;
     } });
-    __exportStar(require_interceptor(), exports2);
+    __exportStar(require_interceptor2(), exports2);
     exports2.instance = new gaxios_js_1.Gaxios();
     async function request(opts) {
       return exports2.instance.request(opts);
@@ -60997,7 +62704,7 @@ var require_logging_utils = __commonJS({
 });
 
 // node_modules/google-logging-utils/build/src/index.js
-var require_src6 = __commonJS({
+var require_src7 = __commonJS({
   "node_modules/google-logging-utils/build/src/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
@@ -61022,7 +62729,7 @@ var require_src6 = __commonJS({
 });
 
 // node_modules/google-auth-library/node_modules/gcp-metadata/build/src/index.js
-var require_src7 = __commonJS({
+var require_src8 = __commonJS({
   "node_modules/google-auth-library/node_modules/gcp-metadata/build/src/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
@@ -61076,10 +62783,10 @@ var require_src7 = __commonJS({
     exports2.getGCPResidency = getGCPResidency;
     exports2.setGCPResidency = setGCPResidency;
     exports2.requestTimeout = requestTimeout;
-    var gaxios_1 = require_src5();
+    var gaxios_1 = require_src6();
     var jsonBigint = require_json_bigint();
     var gcp_residency_1 = require_gcp_residency();
-    var logger = __importStar(require_src6());
+    var logger = __importStar(require_src7());
     exports2.BASE_PATH = "/computeMetadata/v1";
     exports2.HOST_ADDRESS = "http://169.254.169.254";
     exports2.SECONDARY_HOST_ADDRESS = "http://metadata.google.internal.";
@@ -61838,7 +63545,7 @@ var require_ecdsa_sig_formatter = __commonJS({
 });
 
 // node_modules/google-auth-library/build/src/util.js
-var require_util12 = __commonJS({
+var require_util13 = __commonJS({
   "node_modules/google-auth-library/build/src/util.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
@@ -61953,11 +63660,11 @@ var require_util12 = __commonJS({
 });
 
 // node_modules/google-auth-library/package.json
-var require_package3 = __commonJS({
+var require_package4 = __commonJS({
   "node_modules/google-auth-library/package.json"(exports2, module2) {
     module2.exports = {
       name: "google-auth-library",
-      version: "11.0.2",
+      version: "11.3.1",
       author: "Google Inc.",
       description: "Google APIs Authentication Client Library for Node.js",
       engines: {
@@ -61980,7 +63687,7 @@ var require_package3 = __commonJS({
       dependencies: {
         "base64-js": "^1.3.0",
         "ecdsa-sig-formatter": "^1.0.11",
-        gaxios: "^7.1.4",
+        gaxios: "^8.3.0",
         "gcp-metadata": "^9.0.0",
         "google-logging-utils": "^2.0.0",
         jws: "^4.0.0"
@@ -62008,7 +63715,6 @@ var require_package3 = __commonJS({
         "karma-mocha": "^2.0.0",
         "karma-sourcemap-loader": "^0.4.0",
         "karma-webpack": "^5.0.0",
-        keypair: "^1.0.4",
         mocha: "^11.1.0",
         mv: "^2.1.1",
         ncp: "^2.0.0",
@@ -62025,25 +63731,24 @@ var require_package3 = __commonJS({
         "build/src",
         "!build/src/**/*.map"
       ],
+      license: "Apache-2.0",
+      homepage: "https://github.com/googleapis/google-cloud-node/tree/main/core/packages/google-auth-library-nodejs",
       scripts: {
-        test: "c8 mocha build/test",
+        test: "node ../../../bin/run-test.cjs build/test",
         clean: "gts clean",
-        prepare: "npm run compile",
         lint: "gts check --no-inline-config",
         compile: "tsc -p .",
         fix: "gts fix",
-        pretest: "npm run compile -- --sourceMap",
+        pretest: "pnpm run compile --sourceMap",
         docs: "jsdoc -c .jsdoc.js",
-        "samples-setup": "cd samples/ && npm link ../ && npm run setup && cd ../",
-        "samples-test": "cd samples/ && npm link ../ && npm test && cd ../",
+        "samples-setup": "cd samples/ && pnpm link ../ && pnpm run setup && cd ../",
+        "samples-test": "cd samples/ && pnpm link ../ && pnpm test && cd ../",
         "system-test": "mocha build/system-test --timeout 60000",
-        "presystem-test": "npm run compile -- --sourceMap",
+        "presystem-test": "pnpm run compile --sourceMap",
         webpack: "webpack",
         "browser-test": "karma start",
-        prelint: "cd samples; npm link ../; npm install"
-      },
-      license: "Apache-2.0",
-      homepage: "https://github.com/googleapis/google-cloud-node/tree/main/core/packages/google-auth-library-nodejs"
+        prelint: "cd samples; pnpm link ../; pnpm install"
+      }
     };
   }
 });
@@ -62054,7 +63759,7 @@ var require_shared2 = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.USER_AGENT = exports2.PRODUCT_NAME = exports2.pkg = void 0;
-    var pkg = require_package3();
+    var pkg = require_package4();
     exports2.pkg = pkg;
     var PRODUCT_NAME = "google-api-nodejs-client";
     exports2.PRODUCT_NAME = PRODUCT_NAME;
@@ -62071,8 +63776,8 @@ var require_authclient = __commonJS({
     exports2.AuthClient = exports2.DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = exports2.DEFAULT_UNIVERSE = void 0;
     var events_1 = require("events");
     var gaxios_1 = require_src5();
-    var util_1 = require_util12();
-    var google_logging_utils_1 = require_src6();
+    var util_1 = require_util13();
+    var google_logging_utils_1 = require_src7();
     var shared_cjs_1 = require_shared2();
     exports2.DEFAULT_UNIVERSE = "googleapis.com";
     exports2.DEFAULT_EAGER_REFRESH_THRESHOLD_MILLIS = 5 * 60 * 1e3;
@@ -62360,7 +64065,7 @@ var require_oauth2client = __commonJS({
     var querystring = require("querystring");
     var stream = require("stream");
     var formatEcdsa = require_ecdsa_sig_formatter();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var crypto_1 = require_crypto3();
     var authclient_1 = require_authclient();
     var loginticket_1 = require_loginticket();
@@ -63038,7 +64743,7 @@ var require_computeclient = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.Compute = void 0;
     var gaxios_1 = require_src5();
-    var gcpMetadata = require_src7();
+    var gcpMetadata = require_src8();
     var oauth2client_1 = require_oauth2client();
     var Compute = class extends oauth2client_1.OAuth2Client {
       serviceAccountEmail;
@@ -63177,7 +64882,7 @@ var require_envDetect = __commonJS({
     exports2.GCPEnv = void 0;
     exports2.clear = clear;
     exports2.getEnv = getEnv;
-    var gcpMetadata = require_src7();
+    var gcpMetadata = require_src8();
     var GCPEnv;
     (function(GCPEnv2) {
       GCPEnv2["APP_ENGINE"] = "APP_ENGINE";
@@ -64207,7 +65912,7 @@ var require_jwtaccess = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.JWTAccess = void 0;
     var jws = require_jws();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var DEFAULT_HEADER = {
       alg: "RS256",
       typ: "JWT"
@@ -64778,7 +66483,7 @@ var require_impersonated = __commonJS({
     exports2.Impersonated = exports2.IMPERSONATED_ACCOUNT_TYPE = void 0;
     var oauth2client_1 = require_oauth2client();
     var gaxios_1 = require_src5();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     exports2.IMPERSONATED_ACCOUNT_TYPE = "impersonated_service_account";
     var Impersonated = class _Impersonated extends oauth2client_1.OAuth2Client {
       sourceClient;
@@ -65106,7 +66811,7 @@ var require_stscredentials = __commonJS({
     var gaxios_1 = require_src5();
     var authclient_1 = require_authclient();
     var oauth2common_1 = require_oauth2common();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var StsCredentials = class _StsCredentials extends oauth2common_1.OAuthClientAuthHandler {
       #tokenExchangeEndpoint;
       /**
@@ -65195,7 +66900,7 @@ var require_baseexternalclient = __commonJS({
     var stream = require("stream");
     var authclient_1 = require_authclient();
     var sts = require_stscredentials();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var shared_cjs_1 = require_shared2();
     var STS_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
     var STS_REQUEST_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
@@ -65693,7 +67398,7 @@ var require_certificatesubjecttokensupplier = __commonJS({
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.CertificateSubjectTokenSupplier = exports2.InvalidConfigurationError = exports2.CertificateSourceUnavailableError = exports2.CERTIFICATE_CONFIGURATION_ENV_VARIABLE = void 0;
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var fs4 = require("fs");
     var crypto_1 = require("crypto");
     var https2 = require("https");
@@ -65878,7 +67583,7 @@ var require_identitypoolclient = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.IdentityPoolClient = void 0;
     var baseexternalclient_1 = require_baseexternalclient();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var filesubjecttokensupplier_1 = require_filesubjecttokensupplier();
     var urlsubjecttokensupplier_1 = require_urlsubjecttokensupplier();
     var certificatesubjecttokensupplier_1 = require_certificatesubjecttokensupplier();
@@ -66297,7 +68002,7 @@ var require_awsclient = __commonJS({
     var awsrequestsigner_1 = require_awsrequestsigner();
     var baseexternalclient_1 = require_baseexternalclient();
     var defaultawssecuritycredentialssupplier_1 = require_defaultawssecuritycredentialssupplier();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     var gaxios_1 = require_src5();
     var AwsClient = class _AwsClient extends baseexternalclient_1.BaseExternalAccountClient {
       environmentId;
@@ -67329,7 +69034,7 @@ var require_googleauth = __commonJS({
     var child_process_1 = require("child_process");
     var fs4 = require("fs");
     var gaxios_1 = require_src5();
-    var gcpMetadata = require_src7();
+    var gcpMetadata = require_src8();
     var os5 = require("os");
     var path = require("path");
     var crypto_1 = require_crypto3();
@@ -67344,7 +69049,7 @@ var require_googleauth = __commonJS({
     var authclient_1 = require_authclient();
     var externalAccountAuthorizedUserClient_1 = require_externalAccountAuthorizedUserClient();
     var gdchclient_1 = require_gdchclient();
-    var util_1 = require_util12();
+    var util_1 = require_util13();
     exports2.GoogleAuthExceptionMessages = {
       API_KEY_WITH_CREDENTIALS: "API Keys and Credentials are mutually exclusive authentication methods and cannot be used together.",
       NO_PROJECT_ID_FOUND: "Unable to detect a Project Id in the current environment. \nTo learn more about authentication and Google APIs, visit: \nhttps://cloud.google.com/docs/authentication/getting-started",
@@ -68395,7 +70100,7 @@ var require_passthrough = __commonJS({
 });
 
 // node_modules/google-auth-library/build/src/index.js
-var require_src8 = __commonJS({
+var require_src9 = __commonJS({
   "node_modules/google-auth-library/build/src/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
@@ -68420,7 +70125,7 @@ var require_src8 = __commonJS({
     Object.defineProperty(exports2, "GoogleAuth", { enumerable: true, get: function() {
       return googleauth_1.GoogleAuth;
     } });
-    exports2.gcpMetadata = require_src7();
+    exports2.gcpMetadata = require_src8();
     exports2.gaxios = require_src5();
     var authclient_1 = require_authclient();
     Object.defineProperty(exports2, "AuthClient", { enumerable: true, get: function() {
@@ -68959,7 +70664,7 @@ var require_warnings = __commonJS({
 });
 
 // node_modules/google-gax/build/src/util.js
-var require_util13 = __commonJS({
+var require_util14 = __commonJS({
   "node_modules/google-gax/build/src/util.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
@@ -69137,7 +70842,7 @@ var require_gax = __commonJS({
     exports2.constructSettings = constructSettings;
     exports2.createByteLengthFunction = createByteLengthFunction;
     var warnings_1 = require_warnings();
-    var util_1 = require_util13();
+    var util_1 = require_util14();
     var status_1 = require_status();
     var RetryOptions = class {
       retryCodes;
@@ -69665,7 +71370,7 @@ var require_grpc = __commonJS({
     var grpcProtoLoader = __importStar(require_src2());
     var child_process_1 = require("child_process");
     var fs4 = __importStar(require("fs"));
-    var google_auth_library_1 = require_src8();
+    var google_auth_library_1 = require_src9();
     var grpc = __importStar(require_src3());
     var os5 = __importStar(require("os"));
     var path_1 = require("path");
@@ -79103,7 +80808,7 @@ var require_enum2 = __commonJS({
 });
 
 // node_modules/proto3-json-serializer/build/src/util.js
-var require_util14 = __commonJS({
+var require_util15 = __commonJS({
   "node_modules/proto3-json-serializer/build/src/util.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
@@ -79148,7 +80853,7 @@ var require_value = __commonJS({
     exports2.googleProtobufStructFromProto3JSON = googleProtobufStructFromProto3JSON;
     exports2.googleProtobufListValueFromProto3JSON = googleProtobufListValueFromProto3JSON;
     exports2.googleProtobufValueFromProto3JSON = googleProtobufValueFromProto3JSON;
-    var util_1 = require_util14();
+    var util_1 = require_util15();
     function googleProtobufStructToProto3JSON(obj) {
       const result = {};
       const fields = obj.fields;
@@ -79315,7 +81020,7 @@ var require_wrappers2 = __commonJS({
     exports2.wrapperToProto3JSON = wrapperToProto3JSON;
     exports2.wrapperFromProto3JSON = wrapperFromProto3JSON;
     var bytes_1 = require_bytes();
-    var util_1 = require_util14();
+    var util_1 = require_util15();
     function wrapperToProto3JSON(obj) {
       if (!Object.prototype.hasOwnProperty.call(obj, "value")) {
         return null;
@@ -79382,7 +81087,7 @@ var require_fromproto3json = __commonJS({
     var bytes_1 = require_bytes();
     var enum_1 = require_enum2();
     var value_1 = require_value();
-    var util_1 = require_util14();
+    var util_1 = require_util15();
     var duration_1 = require_duration2();
     var timestamp_1 = require_timestamp();
     var wrappers_1 = require_wrappers2();
@@ -79596,7 +81301,7 @@ var require_toproto3json = __commonJS({
     exports2.toProto3JSON = toProto3JSON;
     var any_1 = require_any();
     var bytes_1 = require_bytes();
-    var util_1 = require_util14();
+    var util_1 = require_util15();
     var enum_1 = require_enum2();
     var value_1 = require_value();
     var duration_1 = require_duration2();
@@ -79718,7 +81423,7 @@ var require_toproto3json = __commonJS({
 });
 
 // node_modules/proto3-json-serializer/build/src/index.js
-var require_src9 = __commonJS({
+var require_src10 = __commonJS({
   "node_modules/proto3-json-serializer/build/src/index.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
@@ -79801,7 +81506,7 @@ var require_transcoding = __commonJS({
     exports2.isProto3OptionalField = isProto3OptionalField;
     exports2.transcode = transcode;
     exports2.overrideHttpRules = overrideHttpRules;
-    var util_1 = require_util13();
+    var util_1 = require_util14();
     var httpOptionName = "(google.api.http)";
     var proto3OptionalName = "proto3_optional";
     var supportedHttpMethods = ["get", "post", "put", "patch", "delete"];
@@ -80067,7 +81772,7 @@ var require_fallbackRest = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.encodeRequest = encodeRequest;
     exports2.decodeResponse = decodeResponse;
-    var serializer = __importStar(require_src9());
+    var serializer = __importStar(require_src10());
     var fallback_1 = require_fallback();
     var googleError_1 = require_googleError();
     var transcoding_1 = require_transcoding();
@@ -80301,7 +82006,7 @@ var require_fallbackServiceStub = __commonJS({
     })();
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.generateServiceStub = generateServiceStub;
-    var serializer = __importStar(require_src9());
+    var serializer = __importStar(require_src10());
     var featureDetection_1 = require_featureDetection();
     var streamArrayParser_1 = require_streamArrayParser();
     var fallback_1 = require_fallback();
@@ -84269,7 +85974,7 @@ var require_pathTemplate = __commonJS({
 });
 
 // node_modules/google-gax/package.json
-var require_package4 = __commonJS({
+var require_package5 = __commonJS({
   "node_modules/google-gax/package.json"(exports2, module2) {
     module2.exports = {
       name: "google-gax",
@@ -85612,7 +87317,7 @@ var require_bundleDescriptor = __commonJS({
     var normalApiCaller_1 = require_normalApiCaller();
     var bundleApiCaller_1 = require_bundleApiCaller();
     var bundleExecutor_1 = require_bundleExecutor();
-    var util_1 = require_util13();
+    var util_1 = require_util14();
     var BundleDescriptor = class {
       bundledField;
       requestDiscriminatorFields;
@@ -85789,7 +87494,7 @@ var require_iamService = __commonJS({
     var routingHeader = __importStar(require_routingHeader());
     var gapicConfig = __importStar(require_iam_policy_service_client_config());
     var fallback = __importStar(require_fallback());
-    var version = require_package4().version;
+    var version = require_package5().version;
     var jsonProtos = require_iam_service2();
     var IamClient = class {
       _terminated = false;
@@ -86076,7 +87781,7 @@ var require_locationService = __commonJS({
     var pageDescriptor_1 = require_pageDescriptor();
     var jsonProtos = require_locations2();
     var gapicConfig = __importStar(require_locations_client_config());
-    var version = require_package4().version;
+    var version = require_package5().version;
     var LocationsClient = class {
       _terminated = false;
       _opts;
@@ -86440,14 +88145,14 @@ var require_fallback = __commonJS({
     var routingHeader = __importStar(require_routingHeader());
     exports2.routingHeader = routingHeader;
     var status_1 = require_status();
-    var google_auth_library_1 = require_src8();
+    var google_auth_library_1 = require_src9();
     var operationsClient_1 = require_operationsClient();
     var createApiCall_1 = require_createApiCall();
     var fallbackRest = __importStar(require_fallbackRest());
     var featureDetection_1 = require_featureDetection();
     var fallbackServiceStub_1 = require_fallbackServiceStub();
     var streaming_1 = require_streaming();
-    var util_1 = require_util13();
+    var util_1 = require_util14();
     var IamProtos = __importStar(require_iam_service());
     exports2.IamProtos = IamProtos;
     var LocationProtos = __importStar(require_locations());
@@ -86471,7 +88176,7 @@ var require_fallback = __commonJS({
     Object.defineProperty(exports2, "createDefaultBackoffSettings", { enumerable: true, get: function() {
       return gax_1.createDefaultBackoffSettings;
     } });
-    exports2.version = require_package4().version + "-fallback";
+    exports2.version = require_package5().version + "-fallback";
     var descriptor_1 = require_descriptor3();
     Object.defineProperty(exports2, "BundleDescriptor", { enumerable: true, get: function() {
       return descriptor_1.BundleDescriptor;
@@ -86501,7 +88206,7 @@ var require_fallback = __commonJS({
     Object.defineProperty(exports2, "LocationsClient", { enumerable: true, get: function() {
       return locationService_1.LocationsClient;
     } });
-    var util_2 = require_util13();
+    var util_2 = require_util14();
     Object.defineProperty(exports2, "makeUUID", { enumerable: true, get: function() {
       return util_2.makeUUID;
     } });
@@ -86550,7 +88255,7 @@ var require_fallback = __commonJS({
           });
         }
         this.fallback = options.fallback ? true : false;
-        this.grpcVersion = require_package4().version;
+        this.grpcVersion = require_package5().version;
         this.httpRules = options.httpRules;
         this.numericEnums = options.numericEnums ?? false;
         this.minifyJson = options.minifyJson ?? false;
@@ -86811,7 +88516,7 @@ var require_googleError = __commonJS({
     exports2.GoogleErrorDecoder = exports2.GoogleError = void 0;
     var status_1 = require_status();
     var protobuf = __importStar(require_protobufjs());
-    var serializer = __importStar(require_src9());
+    var serializer = __importStar(require_src10());
     var fallback_1 = require_fallback();
     var PROTO_TYPE_PREFIX = "type.googleapis.com/";
     var RESOURCE_INFO_TYPE = "type.googleapis.com/google.rpc.ResourceInfo";
@@ -87560,7 +89265,7 @@ var require_operationsClient = __commonJS({
     var operationProtoJson = require_operations2();
     var transcoding_1 = require_transcoding();
     exports2.SERVICE_ADDRESS = "longrunning.googleapis.com";
-    var version = require_package4().version;
+    var version = require_package5().version;
     var DEFAULT_SERVICE_PORT = 443;
     var CODE_GEN_NAME_VERSION = "gapic/0.7.1";
     exports2.ALL_SCOPES = [];
@@ -87941,7 +89646,7 @@ var require_operationsClient = __commonJS({
 });
 
 // node_modules/google-gax/build/src/index.js
-var require_src10 = __commonJS({
+var require_src11 = __commonJS({
   "node_modules/google-gax/build/src/index.js"(exports2) {
     "use strict";
     var __createBinding = exports2 && exports2.__createBinding || (Object.create ? (function(o, m2, k, k2) {
@@ -87996,12 +89701,12 @@ var require_src10 = __commonJS({
     var operationsClient = __importStar(require_operationsClient());
     var routingHeader = __importStar(require_routingHeader());
     exports2.routingHeader = routingHeader;
-    var google_auth_library_1 = require_src8();
+    var google_auth_library_1 = require_src9();
     Object.defineProperty(exports2, "GoogleAuth", { enumerable: true, get: function() {
       return google_auth_library_1.GoogleAuth;
     } });
-    exports2.googleAuthLibrary = __importStar(require_src8());
-    exports2.loggingUtils = __importStar(require_src6());
+    exports2.googleAuthLibrary = __importStar(require_src9());
+    exports2.loggingUtils = __importStar(require_src7());
     var call_1 = require_call2();
     Object.defineProperty(exports2, "OngoingCall", { enumerable: true, get: function() {
       return call_1.OngoingCall;
@@ -88101,14 +89806,14 @@ var require_src10 = __commonJS({
       return locationService_1.LocationsClient;
     } });
     exports2.createByteLengthFunction = grpc_1.GrpcClient?.createByteLengthFunction;
-    exports2.version = require_package4().version;
+    exports2.version = require_package5().version;
     var protobuf = __importStar(require_protobufjs());
     exports2.protobuf = protobuf;
     exports2.protobufMinimal = __importStar(require_minimal2());
     var fallback = __importStar(require_fallback());
     exports2.fallback = fallback;
     exports2.protobufFromJSON = fallback.protobufFromJSON;
-    var util_1 = require_util13();
+    var util_1 = require_util14();
     Object.defineProperty(exports2, "makeUUID", { enumerable: true, get: function() {
       return util_1.makeUUID;
     } });
@@ -88126,7 +89831,7 @@ var require_src10 = __commonJS({
     Object.defineProperty(exports2, "warn", { enumerable: true, get: function() {
       return warnings_1.warn;
     } });
-    var serializer = __importStar(require_src9());
+    var serializer = __importStar(require_src10());
     exports2.serializer = serializer;
   }
 });
@@ -88179,12 +89884,12 @@ var require_autokey_client_config = __commonJS({
 });
 
 // node_modules/@google-cloud/kms/package.json
-var require_package5 = __commonJS({
+var require_package6 = __commonJS({
   "node_modules/@google-cloud/kms/package.json"(exports2, module2) {
     module2.exports = {
       name: "@google-cloud/kms",
       description: "Google Cloud Key Management Service (KMS) API client for Node.js",
-      version: "6.0.0",
+      version: "6.3.0",
       license: "Apache-2.0",
       author: "Google LLC",
       engines: {
@@ -88225,8 +89930,8 @@ var require_package5 = __commonJS({
         prelint: "cd samples; npm link ../; npm i",
         postpack: "minifyProtoJson",
         "samples-test": "cd samples/ && npm link ../ && npm i && npm test",
-        "system-test": "c8 mocha --config ../../.mocharc.cjs --no-parallel build/system-test",
-        test: "c8 mocha --config ../../.mocharc.cjs build/test"
+        "system-test": "node ../../bin/run-test.cjs --config ../../.mocharc.cjs --no-parallel build/system-test",
+        test: "node ../../bin/run-test.cjs --config ../../.mocharc.cjs build/test"
       },
       dependencies: {
         "google-gax": "^6.0.0"
@@ -88250,11 +89955,6 @@ var require_package5 = __commonJS({
       homepage: "https://github.com/googleapis/google-cloud-node/tree/main/packages/google-cloud-kms",
       overrides: {
         "@sinonjs/fake-timers": "15.2.1"
-      },
-      pnpm: {
-        overrides: {
-          "@sinonjs/fake-timers": "15.2.1"
-        }
       }
     };
   }
@@ -88267,9 +89967,9 @@ var require_autokey_client = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.AutokeyClient = void 0;
     var jsonProtos = require_protos();
-    var google_gax_1 = require_src10();
+    var google_gax_1 = require_src11();
     var gapicConfig = require_autokey_client_config();
-    var version = require_package5().version;
+    var version = require_package6().version;
     var AutokeyClient = class {
       _terminated = false;
       _opts;
@@ -88353,7 +90053,7 @@ var require_autokey_client = __commonJS({
           opts["scopes"] = staticMembers.scopes;
         }
         if (!gaxInstance) {
-          gaxInstance = require_src10();
+          gaxInstance = require_src11();
         }
         this._gaxModule = opts.fallback ? gaxInstance.fallback : gaxInstance;
         this._gaxGrpc = new this._gaxModule.GrpcClient(opts);
@@ -89858,9 +91558,9 @@ var require_autokey_admin_client = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.AutokeyAdminClient = void 0;
     var jsonProtos = require_protos();
-    var google_gax_1 = require_src10();
+    var google_gax_1 = require_src11();
     var gapicConfig = require_autokey_admin_client_config();
-    var version = require_package5().version;
+    var version = require_package6().version;
     var AutokeyAdminClient = class {
       _terminated = false;
       _opts;
@@ -89943,7 +91643,7 @@ var require_autokey_admin_client = __commonJS({
           opts["scopes"] = staticMembers.scopes;
         }
         if (!gaxInstance) {
-          gaxInstance = require_src10();
+          gaxInstance = require_src11();
         }
         this._gaxModule = opts.fallback ? gaxInstance.fallback : gaxInstance;
         this._gaxGrpc = new this._gaxModule.GrpcClient(opts);
@@ -91073,9 +92773,9 @@ var require_ekm_service_client = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.EkmServiceClient = void 0;
     var jsonProtos = require_protos();
-    var google_gax_1 = require_src10();
+    var google_gax_1 = require_src11();
     var gapicConfig = require_ekm_service_client_config();
-    var version = require_package5().version;
+    var version = require_package6().version;
     var EkmServiceClient = class {
       _terminated = false;
       _opts;
@@ -91158,7 +92858,7 @@ var require_ekm_service_client = __commonJS({
           opts["scopes"] = staticMembers.scopes;
         }
         if (!gaxInstance) {
-          gaxInstance = require_src10();
+          gaxInstance = require_src11();
         }
         this._gaxModule = opts.fallback ? gaxInstance.fallback : gaxInstance;
         this._gaxGrpc = new this._gaxModule.GrpcClient(opts);
@@ -92565,9 +94265,9 @@ var require_hsm_management_client = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.HsmManagementClient = void 0;
     var jsonProtos = require_protos();
-    var google_gax_1 = require_src10();
+    var google_gax_1 = require_src11();
     var gapicConfig = require_hsm_management_client_config();
-    var version = require_package5().version;
+    var version = require_package6().version;
     var HsmManagementClient = class {
       _terminated = false;
       _opts;
@@ -92651,7 +94351,7 @@ var require_hsm_management_client = __commonJS({
           opts["scopes"] = staticMembers.scopes;
         }
         if (!gaxInstance) {
-          gaxInstance = require_src10();
+          gaxInstance = require_src11();
         }
         this._gaxModule = opts.fallback ? gaxInstance.fallback : gaxInstance;
         this._gaxGrpc = new this._gaxModule.GrpcClient(opts);
@@ -94703,9 +96403,9 @@ var require_key_management_service_client = __commonJS({
     Object.defineProperty(exports2, "__esModule", { value: true });
     exports2.KeyManagementServiceClient = void 0;
     var jsonProtos = require_protos();
-    var google_gax_1 = require_src10();
+    var google_gax_1 = require_src11();
     var gapicConfig = require_key_management_service_client_config();
-    var version = require_package5().version;
+    var version = require_package6().version;
     var KeyManagementServiceClient2 = class {
       _terminated = false;
       _opts;
@@ -94789,7 +96489,7 @@ var require_key_management_service_client = __commonJS({
           opts["scopes"] = staticMembers.scopes;
         }
         if (!gaxInstance) {
-          gaxInstance = require_src10();
+          gaxInstance = require_src11();
         }
         this._gaxModule = opts.fallback ? gaxInstance.fallback : gaxInstance;
         this._gaxGrpc = new this._gaxModule.GrpcClient(opts);
@@ -107145,6 +108845,7 @@ var require_protos2 = __commonJS({
                 }
                 ExternalProtectionLevelOptions.prototype.externalKeyUri = "";
                 ExternalProtectionLevelOptions.prototype.ekmConnectionKeyPath = "";
+                ExternalProtectionLevelOptions.prototype.ekmConnectionBackendOverride = "";
                 ExternalProtectionLevelOptions.create = function create(properties) {
                   return new ExternalProtectionLevelOptions(properties);
                 };
@@ -107152,6 +108853,7 @@ var require_protos2 = __commonJS({
                   if (!writer) writer = $Writer.create();
                   if (message.externalKeyUri != null && Object.hasOwnProperty.call(message, "externalKeyUri")) writer.uint32(10).string(message.externalKeyUri);
                   if (message.ekmConnectionKeyPath != null && Object.hasOwnProperty.call(message, "ekmConnectionKeyPath")) writer.uint32(18).string(message.ekmConnectionKeyPath);
+                  if (message.ekmConnectionBackendOverride != null && Object.hasOwnProperty.call(message, "ekmConnectionBackendOverride")) writer.uint32(26).string(message.ekmConnectionBackendOverride);
                   return writer;
                 };
                 ExternalProtectionLevelOptions.encodeDelimited = function encodeDelimited(message, writer) {
@@ -107172,6 +108874,10 @@ var require_protos2 = __commonJS({
                       }
                       case 2: {
                         message.ekmConnectionKeyPath = reader.string();
+                        break;
+                      }
+                      case 3: {
+                        message.ekmConnectionBackendOverride = reader.string();
                         break;
                       }
                       default:
@@ -107195,6 +108901,9 @@ var require_protos2 = __commonJS({
                   if (message.ekmConnectionKeyPath != null && message.hasOwnProperty("ekmConnectionKeyPath")) {
                     if (!$util.isString(message.ekmConnectionKeyPath)) return "ekmConnectionKeyPath: string expected";
                   }
+                  if (message.ekmConnectionBackendOverride != null && message.hasOwnProperty("ekmConnectionBackendOverride")) {
+                    if (!$util.isString(message.ekmConnectionBackendOverride)) return "ekmConnectionBackendOverride: string expected";
+                  }
                   return null;
                 };
                 ExternalProtectionLevelOptions.fromObject = function fromObject(object, long) {
@@ -107204,6 +108913,7 @@ var require_protos2 = __commonJS({
                   var message = new $root.google.cloud.kms.v1.ExternalProtectionLevelOptions();
                   if (object.externalKeyUri != null) message.externalKeyUri = String(object.externalKeyUri);
                   if (object.ekmConnectionKeyPath != null) message.ekmConnectionKeyPath = String(object.ekmConnectionKeyPath);
+                  if (object.ekmConnectionBackendOverride != null) message.ekmConnectionBackendOverride = String(object.ekmConnectionBackendOverride);
                   return message;
                 };
                 ExternalProtectionLevelOptions.toObject = function toObject(message, options) {
@@ -107212,9 +108922,11 @@ var require_protos2 = __commonJS({
                   if (options.defaults) {
                     object.externalKeyUri = "";
                     object.ekmConnectionKeyPath = "";
+                    object.ekmConnectionBackendOverride = "";
                   }
                   if (message.externalKeyUri != null && message.hasOwnProperty("externalKeyUri")) object.externalKeyUri = message.externalKeyUri;
                   if (message.ekmConnectionKeyPath != null && message.hasOwnProperty("ekmConnectionKeyPath")) object.ekmConnectionKeyPath = message.ekmConnectionKeyPath;
+                  if (message.ekmConnectionBackendOverride != null && message.hasOwnProperty("ekmConnectionBackendOverride")) object.ekmConnectionBackendOverride = message.ekmConnectionBackendOverride;
                   return object;
                 };
                 ExternalProtectionLevelOptions.prototype.toJSON = function toJSON() {
@@ -127553,7 +129265,7 @@ var require_protos2 = __commonJS({
 });
 
 // node_modules/@google-cloud/kms/build/src/index.js
-var require_src11 = __commonJS({
+var require_src12 = __commonJS({
   "node_modules/@google-cloud/kms/build/src/index.js"(exports2) {
     "use strict";
     Object.defineProperty(exports2, "__esModule", { value: true });
@@ -128226,7 +129938,7 @@ function buildJwtSigningMessage(clientId, nowSeconds) {
 
 // src/google-cloud/kms-sign-sdk.ts
 var import_node_crypto = require("node:crypto");
-var import_kms = __toESM(require_src11(), 1);
+var import_kms = __toESM(require_src12(), 1);
 async function signWithKms(kmsKeyName, message) {
   const kms = new import_kms.KeyManagementServiceClient();
   const digest = (0, import_node_crypto.createHash)("sha256").update(message).digest();

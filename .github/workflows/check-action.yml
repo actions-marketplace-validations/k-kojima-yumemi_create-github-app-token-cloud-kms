@@ -2,12 +2,12 @@ name: Check action
 on:
   push:
     paths:
-      - '.github/workflows/**.yaml'
-      - '.github/workflows/**.yml'
+      - ".github/workflows/**.yaml"
+      - ".github/workflows/**.yml"
   pull_request:
     paths:
-      - '.github/workflows/**.yaml'
-      - '.github/workflows/**.yml'
+      - ".github/workflows/**.yaml"
+      - ".github/workflows/**.yml"
 
 permissions:
   contents: read
